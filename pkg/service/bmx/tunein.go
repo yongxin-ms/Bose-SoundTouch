@@ -214,6 +214,7 @@ func tuneInSectionsAshx(tuneInURI string, subsection *int) ([]models.BmxNavSecti
 
 		if children, ok := m["children"].([]interface{}); ok && len(children) > 0 {
 			name, _ := m["text"].(string)
+
 			section := models.BmxNavSection{
 				Name:  name,
 				Items: make([]models.BmxNavItem, 0, len(children)),
@@ -223,6 +224,7 @@ func tuneInSectionsAshx(tuneInURI string, subsection *int) ([]models.BmxNavSecti
 				if !ok {
 					continue
 				}
+
 				childType, _ := cm["type"].(string)
 				if childType == "audio" {
 					section.Items = append(section.Items, tuneInNavigatePlayItem(cm))
@@ -230,7 +232,9 @@ func tuneInSectionsAshx(tuneInURI string, subsection *int) ([]models.BmxNavSecti
 					section.Items = append(section.Items, tuneInNavigateLink(cm))
 				}
 			}
+
 			sections = append(sections, section)
+
 			continue
 		}
 
