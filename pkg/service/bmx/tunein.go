@@ -219,6 +219,7 @@ func tuneInSectionsAshx(tuneInURI string, subsection *int) ([]models.BmxNavSecti
 				Name:  name,
 				Items: make([]models.BmxNavItem, 0, len(children)),
 			}
+
 			for _, child := range children {
 				cm, ok := child.(map[string]interface{})
 				if !ok {
