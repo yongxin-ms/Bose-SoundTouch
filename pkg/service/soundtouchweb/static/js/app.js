@@ -102,7 +102,6 @@ function App() {
             if (msg.type === 'devices') {
                 setDevices(msg.data || {});
             } else if (msg.type === 'discovery_status') {
-                console.log('[DEBUG_LOG] discovery_status:', msg.data);
                 if (msg.data?.isDiscovering !== undefined) {
                     setIsDiscovering(msg.data.isDiscovering);
                 } else if (msg.data?.status === 'starting') {
@@ -116,7 +115,11 @@ function App() {
                 }
             } else if (msg.type === 'status_update' && msg.deviceId) {
                 setDevices(prev => {
-                    if (!prev[msg.deviceId]) return prev;
+                    // Object.prototype.hasOwnProperty, not a plain prev[msg.deviceId]
+                    // truthy check: a deviceId of "__proto__" or "constructor" would
+                    // otherwise resolve through the prototype chain to a truthy value
+                    // and pass the check despite not being a real, known device.
+                    if (!Object.prototype.hasOwnProperty.call(prev, msg.deviceId)) return prev;
                     return {
                         ...prev,
                         [msg.deviceId]: { ...prev[msg.deviceId], status: msg.data },
