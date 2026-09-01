@@ -46,23 +46,10 @@ func (app *WebApp) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Send initial device list
-	snapshot := app.DeviceSnapshot()
-	devices := make(map[string]interface{}, len(snapshot))
-
-	for _, entry := range snapshot {
-		devices[entry.ID] = map[string]interface{}{
-			"info":     entry.Device.DeviceInfo,
-			"status":   entry.Device.Status(),
-			"lastSeen": entry.Device.LastSeen,
-		}
-	}
-
-	initialMessage := webtypes.WebSocketMessage{
+	if err := conn.WriteJSON(webtypes.WebSocketMessage{
 		Type: "devices",
-		Data: devices,
-	}
-
-	if err := conn.WriteJSON(initialMessage); err != nil {
+		Data: app.deviceViewSnapshot(),
+	}); err != nil {
 		log.Printf("Failed to send initial data: %v", err)
 		return
 	}
@@ -100,23 +87,37 @@ func (app *WebApp) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Send periodic status updates
-		for _, entry := range app.DeviceSnapshot() {
-			status := entry.Device.Status()
-			if status.IsConnected {
-				statusMessage := webtypes.WebSocketMessage{
-					Type:     "status_update",
-					DeviceID: entry.ID,
-					Data:     status,
-				}
-
-				if err := conn.WriteJSON(statusMessage); err != nil {
-					log.Printf("Failed to send status update: %v", err)
-					return
-				}
+		for _, message := range app.periodicPlayerMessages() {
+			if err := conn.WriteJSON(message); err != nil {
+				log.Printf("Failed to send device update: %v", err)
+				return
 			}
 		}
 	}
+}
+
+// periodicPlayerMessages refreshes the projected inventory while retaining
+// the established per-device status_update stream for API clients.
+func (app *WebApp) periodicPlayerMessages() []webtypes.WebSocketMessage {
+	snapshot := captureDeviceProjectionEntries(app.DeviceSnapshot())
+	messages := []webtypes.WebSocketMessage{{
+		Type: "devices",
+		Data: projectCapturedDeviceEntries(snapshot),
+	}}
+
+	for _, entry := range snapshot {
+		if entry.Status == nil || !entry.Status.IsConnected {
+			continue
+		}
+
+		messages = append(messages, webtypes.WebSocketMessage{
+			Type:     "status_update",
+			DeviceID: entry.ID,
+			Data:     entry.Status,
+		})
+	}
+
+	return messages
 }
 
 // HandleAPIDiscover triggers device discovery
@@ -218,6 +219,10 @@ func (app *WebApp) ConnectDeviceWebSocket(deviceID string, conn *webtypes.Device
 			})
 		})
 
+		wsClient.OnGroupUpdated(func(event *models.GroupUpdatedEvent) {
+			applyGroupUpdatedEvent(conn, event)
+		})
+
 		if err := wsClient.Connect(); err != nil {
 			log.Printf("Failed to connect WebSocket for device %s: %v (retrying in %s)", sanitizeLog(deviceID), err, backoff)
 
@@ -298,6 +303,16 @@ func (app *WebApp) UpdateDeviceStatus(_ string, conn *webtypes.DeviceConnection)
 		return
 	}
 
+	// /getGroup must be gated to ST10 models -- see Client.GetGroup's doc
+	// comment (verified against real hardware: a ST20 never replies at all,
+	// hanging until the client's timeout instead of returning quickly).
+	stereoCapable := stereoPairCapable(conn.DeviceInfo)
+
+	var groupGeneration uint64
+	if stereoCapable {
+		groupGeneration = conn.BeginGroupRefresh()
+	}
+
 	// Phase 1: slow network fetches. Local vars only, no shared state
 	// is touched yet. Errors are recorded so the merge below can tell
 	// "field N stayed unchanged" apart from "field N got refreshed".
@@ -306,6 +321,15 @@ func (app *WebApp) UpdateDeviceStatus(_ string, conn *webtypes.DeviceConnection)
 	presets, presetsErr := conn.Client.GetPresets()
 	sources, sourcesErr := conn.Client.GetSources()
 	bass, bassErr := conn.Client.GetBass()
+
+	var (
+		group    *models.Group
+		groupErr error
+	)
+
+	if stereoCapable {
+		group, groupErr = conn.Client.GetGroup()
+	}
 
 	// Phase 2: fast merge. Only fields we successfully fetched
 	// overwrite; everything else keeps the value other goroutines may
@@ -338,11 +362,24 @@ func (app *WebApp) UpdateDeviceStatus(_ string, conn *webtypes.DeviceConnection)
 			statusUpdated = true
 		}
 
-		// Mark as connected if we successfully got at least one
-		// status from this round. Mirrors prior behaviour.
+		// Mark as connected if we successfully got at least one status
+		// from this round. Mirrors prior behaviour: deliberately does NOT
+		// fold groupErr in here. GetGroup is gated to stereo-capable
+		// models and trivially succeeds even when a device is otherwise
+		// struggling (an empty <group/> is a near-guaranteed reply), so
+		// counting it would let a device report connected while every
+		// substantive status fetch above actually failed this round.
 		s.IsConnected = statusUpdated
 		s.LastActivity = time.Now()
 	})
+
+	if stereoCapable && groupErr == nil {
+		conn.ApplyPolledGroup(groupGeneration, group)
+	}
+}
+
+func applyGroupUpdatedEvent(conn *webtypes.DeviceConnection, event *models.GroupUpdatedEvent) {
+	conn.ApplyGroupEvent(&event.Group, time.Now())
 }
 
 // HandleDeviceWebSocket handles individual device WebSocket connections for real-time device-specific updates

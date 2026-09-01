@@ -51,6 +51,22 @@ func TestIndexPolyfillsImportMapsForOlderBrowsers(t *testing.T) {
 	}
 }
 
+// TestVendoredDependenciesIncludeLicenses ensures that the license and package
+// metadata copied with the embedded frontend assets are also present in release
+// binaries. scripts/update-static-deps.sh owns these generated files.
+func TestVendoredDependenciesIncludeLicenses(t *testing.T) {
+	for _, dependency := range []string{"preact", "htm", "es-module-shims"} {
+		path := "static/lib/LICENSES/" + dependency + "-LICENSE"
+		if _, err := fs.Stat(StaticFS, path); err != nil {
+			t.Errorf("vendored dependency license %q: %v", path, err)
+		}
+	}
+
+	if _, err := fs.Stat(StaticFS, "static/lib/LICENSES/package-lock.json"); err != nil {
+		t.Errorf("vendored dependency provenance: %v", err)
+	}
+}
+
 // TestIndexImportMapCoversAllVendoredModules guards against the import map
 // and the vendored files it points at drifting apart.
 func TestIndexImportMapCoversAllVendoredModules(t *testing.T) {

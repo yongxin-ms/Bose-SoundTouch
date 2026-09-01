@@ -114,11 +114,12 @@ func (app *WebApp) proxyServiceURL() string {
 	return app.ServiceURL
 }
 
-// DeviceEntry pairs a device id with its connection. Used by
-// DeviceSnapshot so callers can iterate without holding the lock.
+// DeviceEntry pairs a device id with its connection and the LastSeen value
+// captured by DeviceSnapshot under the registry lock.
 type DeviceEntry struct {
-	ID     string
-	Device *webtypes.DeviceConnection
+	ID       string
+	Device   *webtypes.DeviceConnection
+	LastSeen time.Time
 }
 
 // NewWebApp creates a new WebApp instance for SPA mode
@@ -142,9 +143,9 @@ func (app *WebApp) GetDevice(id string) (*webtypes.DeviceConnection, bool) {
 	return device, ok
 }
 
-// DeviceSnapshot returns a list of (id, *DeviceConnection) pairs taken
-// under a single read lock. Callers can iterate the result without
-// holding any registry lock. Devices added or removed after the call
+// DeviceSnapshot returns device entries taken under a single read lock.
+// Callers can iterate the result without holding any registry lock.
+// Devices added or removed after the call
 // are not reflected. A pointer captured here stays valid even if the
 // device is later removed (RemoveDevice only detaches it from the map
 // and stops its goroutines), so iterating a stale snapshot is safe.
@@ -154,7 +155,11 @@ func (app *WebApp) DeviceSnapshot() []DeviceEntry {
 
 	out := make([]DeviceEntry, 0, len(app.devices))
 	for id, device := range app.devices {
-		out = append(out, DeviceEntry{ID: id, Device: device})
+		out = append(out, DeviceEntry{
+			ID:       id,
+			Device:   device,
+			LastSeen: device.LastSeen,
+		})
 	}
 
 	return out
@@ -251,20 +256,9 @@ func (app *WebApp) HandleAPIDevices(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	// Return all devices as JSON
-	snapshot := app.DeviceSnapshot()
-	devices := make(map[string]interface{}, len(snapshot))
-
-	for _, entry := range snapshot {
-		devices[entry.ID] = map[string]interface{}{
-			"info":     entry.Device.DeviceInfo,
-			"status":   entry.Device.Status(),
-			"lastSeen": entry.Device.LastSeen,
-		}
-	}
-
 	response := webtypes.APIResponse{
 		Success: true,
-		Data:    devices,
+		Data:    app.deviceViewSnapshot(),
 	}
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
@@ -734,20 +728,9 @@ func (app *WebApp) BroadcastDeviceList() {
 	app.WSMutex.RLock()
 	defer app.WSMutex.RUnlock()
 
-	snapshot := app.DeviceSnapshot()
-	devices := make(map[string]interface{}, len(snapshot))
-
-	for _, entry := range snapshot {
-		devices[entry.ID] = map[string]interface{}{
-			"info":     entry.Device.DeviceInfo,
-			"status":   entry.Device.Status(),
-			"lastSeen": entry.Device.LastSeen,
-		}
-	}
-
 	message := webtypes.WebSocketMessage{
 		Type: "devices",
-		Data: devices,
+		Data: app.deviceViewSnapshot(),
 	}
 
 	// Send to all connected clients
@@ -1114,6 +1097,54 @@ func (app *WebApp) HandleZoneLeave(w http.ResponseWriter, r *http.Request) {
 	app.sendControlResponse(w,
 		masterConn.Client.RemoveZoneSlave(zone.Master, slaveConn.DeviceInfo.DeviceID, slaveIP),
 		"Left zone")
+}
+
+// HandleGetZoneCandidates returns every registered physical device, for the
+// "add to zone" picker. Unlike HandleAPIDevices, this deliberately bypasses
+// the stereo-pair projection (deviceViewSnapshot): Zone and Group are
+// separate, unrelated groupings, and a device that's currently hidden as a
+// stereo-pair member (see device_projection.go) must still be an
+// independently addressable zone target, exactly as the backend
+// HandleZoneAdd/HandleZoneRemove already treat it (both look devices up via
+// the raw registry, unaffected by projection).
+//
+// Deliberately does not exclude the {id} device itself: which candidates to
+// exclude (the page's own device, current zone members, ...) is a caller
+// concern, not an inherent property of "what devices exist" -- excluding it
+// here would make this endpoint silently unusable for any future caller
+// that isn't Zone.js's current "add to my own zone" flow.
+func (app *WebApp) HandleGetZoneCandidates(w http.ResponseWriter, r *http.Request) {
+	deviceID := chi.URLParam(r, "id")
+
+	if _, exists := app.GetDevice(deviceID); !exists {
+		app.sendError(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	type zoneCandidate struct {
+		Info *models.DeviceInfo `json:"info,omitempty"`
+	}
+
+	candidates := make(map[string]zoneCandidate)
+
+	for _, entry := range app.DeviceSnapshot() {
+		if entry.Device == nil || entry.Device.DeviceInfo == nil {
+			continue
+		}
+
+		candidates[entry.ID] = zoneCandidate{Info: entry.Device.DeviceInfo}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	response := webtypes.APIResponse{
+		Success: true,
+		Data:    candidates,
+	}
+
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
 }
 
 // HandleDeviceRecents returns recently played items for a device.

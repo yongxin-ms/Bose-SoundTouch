@@ -3,9 +3,11 @@
 package webtypes
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gesellix/bose-soundtouch/pkg/models"
 )
@@ -75,6 +77,7 @@ func TestUpdateStatus_PreservesUnchangedFields(t *testing.T) {
 	conn.SetStatus(&DeviceStatus{
 		Volume:      &models.Volume{ActualVolume: 10},
 		Bass:        &models.Bass{ActualBass: 3},
+		Group:       &models.Group{ID: "pair-1", Name: "Living Room"},
 		IsConnected: true,
 	})
 
@@ -92,8 +95,117 @@ func TestUpdateStatus_PreservesUnchangedFields(t *testing.T) {
 		t.Errorf("Bass not preserved: %+v", got.Bass)
 	}
 
+	if got.Group == nil || got.Group.ID != "pair-1" {
+		t.Errorf("Group not preserved: %+v", got.Group)
+	}
+
 	if !got.IsConnected {
 		t.Error("IsConnected not preserved")
+	}
+}
+
+func TestDeviceStatusGroupJSON(t *testing.T) {
+	status := DeviceStatus{
+		Group: &models.Group{
+			ID:             "pair-1",
+			Name:           "Living Room",
+			MasterDeviceID: "master-1",
+		},
+	}
+
+	payload, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("Marshal DeviceStatus: %v", err)
+	}
+
+	var decoded struct {
+		Group *models.Group `json:"group"`
+	}
+
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("Unmarshal DeviceStatus: %v", err)
+	}
+
+	if decoded.Group == nil || decoded.Group.ID != "pair-1" || decoded.Group.MasterDeviceID != "master-1" {
+		t.Fatalf("group did not round-trip in status JSON: %+v", decoded.Group)
+	}
+
+	emptyPayload, err := json.Marshal(DeviceStatus{})
+	if err != nil {
+		t.Fatalf("Marshal empty DeviceStatus: %v", err)
+	}
+
+	var emptyDecoded map[string]json.RawMessage
+	if err := json.Unmarshal(emptyPayload, &emptyDecoded); err != nil {
+		t.Fatalf("Unmarshal empty DeviceStatus: %v", err)
+	}
+
+	if _, ok := emptyDecoded["group"]; ok {
+		t.Errorf("nil group should be omitted, JSON = %s", emptyPayload)
+	}
+}
+
+func TestGroupEventSupersedesInFlightPoll(t *testing.T) {
+	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
+	generation := conn.BeginGroupRefresh()
+
+	eventGroup := &models.Group{ID: "new-pair", MasterDeviceID: "master"}
+	if !conn.ApplyGroupEvent(eventGroup, time.Now()) {
+		t.Fatal("new group event should change group state")
+	}
+
+	if conn.ApplyPolledGroup(generation, &models.Group{ID: "stale-pair"}) {
+		t.Fatal("stale poll must not replace a newer group event")
+	}
+
+	if got := conn.Status().Group; got == nil || got.ID != "new-pair" {
+		t.Fatalf("Group = %+v, want newer event state", got)
+	}
+}
+
+func TestEmptyGroupClearsCurrentClaim(t *testing.T) {
+	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
+	conn.SetStatus(&DeviceStatus{Group: &models.Group{ID: "pair-1"}})
+
+	if !conn.ApplyGroupEvent(&models.Group{}, time.Now()) {
+		t.Fatal("empty teardown event should change group state")
+	}
+
+	if got := conn.Status().Group; got != nil {
+		t.Fatalf("Group = %+v, want nil after teardown", got)
+	}
+}
+
+// TestApplyGroupEventIgnoresRoleOrder guards replaceGroup's change-detection
+// against a spurious "changed" report when the same pair's roles simply
+// arrive in a different order -- a polled /getGroup response and a pushed
+// groupUpdated event both populate Roles.Roles straight from XML unmarshal
+// in wire order, so nothing guarantees they list LEFT/RIGHT the same way
+// every time for the identical pair.
+func TestApplyGroupEventIgnoresRoleOrder(t *testing.T) {
+	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
+
+	leftFirst := &models.Group{
+		ID:             "pair-1",
+		MasterDeviceID: "master",
+		Roles: models.GroupRoles{Roles: []models.GroupRole{
+			{DeviceID: "master", Role: "LEFT"},
+			{DeviceID: "member", Role: "RIGHT"},
+		}},
+	}
+	conn.SetStatus(&DeviceStatus{Group: leftFirst})
+
+	rightFirst := &models.Group{
+		ID:             "pair-1",
+		MasterDeviceID: "master",
+		Roles: models.GroupRoles{Roles: []models.GroupRole{
+			{DeviceID: "member", Role: "RIGHT"},
+			{DeviceID: "master", Role: "LEFT"},
+		}},
+	}
+
+	if conn.ApplyGroupEvent(rightFirst, time.Now()) {
+		t.Fatal("reordered roles for the same pair must not report a change")
 	}
 }
 
