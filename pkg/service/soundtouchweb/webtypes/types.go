@@ -47,11 +47,26 @@ type DeviceConnection struct {
 
 	status atomic.Pointer[DeviceStatus]
 
+	// fieldGenMu guards fieldGen, the per-field generation ordering used by
+	// BeginFieldPoll/CompleteFieldPoll/ApplyFieldEvent. Each StatusField gets
+	// its own (issued, applied) pair so an event or a poll completion for
+	// one field can never invalidate a different field's in-flight result --
+	// see StatusField's doc comment.
+	fieldGenMu sync.Mutex
+	fieldGen   [numStatusFields]struct{ issued, applied uint64 }
+
 	// groupMu orders polled /getGroup responses against real-time
-	// groupUpdated events. Starting a newer refresh or receiving an event
-	// invalidates any older in-flight poll.
-	groupMu         sync.Mutex
-	groupGeneration uint64
+	// groupUpdated events. groupGeneration is the highest generation
+	// issued (by BeginGroupRefresh or ApplyGroupEvent);
+	// groupAppliedGeneration is the highest generation whose result was
+	// actually applied. Invalidation keys off completion order via
+	// groupAppliedGeneration, not merely "a newer refresh has started" —
+	// otherwise a later poll that starts but never applies (e.g. its own
+	// GetGroup fails) would still discard an earlier poll's still-arriving
+	// successful result.
+	groupMu                sync.Mutex
+	groupGeneration        uint64
+	groupAppliedGeneration uint64
 
 	// done is closed by Close when the device is removed from the
 	// registry, signalling its background goroutines (the status poller
@@ -72,6 +87,27 @@ type DeviceStatus struct {
 	IsConnected  bool               `json:"isConnected"`
 	LastActivity time.Time          `json:"lastActivity"`
 }
+
+// StatusField identifies one independently-racing field of DeviceStatus for
+// BeginFieldPoll/CompleteFieldPoll/ApplyFieldEvent's generation ordering.
+// FieldConnectivity covers IsConnected, which is derived by a poll (from
+// whether any of the other fields' fetches succeeded) but set directly by a
+// real-time connectionStateUpdated event, so it races the same way the other
+// fields do. Group has its own, pre-existing pair-aware ordering
+// (groupMu/groupGeneration/groupAppliedGeneration below) and is not part of
+// this set.
+type StatusField int
+
+// The StatusField values.
+const (
+	FieldNowPlaying StatusField = iota
+	FieldVolume
+	FieldPresets
+	FieldSources
+	FieldBass
+	FieldConnectivity
+	numStatusFields
+)
 
 // NewDeviceConnection creates a fully-initialised connection. The
 // status starts with IsConnected=false and LastActivity set to now;
@@ -128,6 +164,52 @@ func (c *DeviceConnection) SetStatus(s *DeviceStatus) {
 	c.status.Store(s)
 }
 
+// BeginFieldPoll reserves a generation for an asynchronous fetch of field,
+// before any network I/O starts. Pass the returned value to CompleteFieldPoll
+// once the fetch completes.
+func (c *DeviceConnection) BeginFieldPoll(field StatusField) uint64 {
+	c.fieldGenMu.Lock()
+	defer c.fieldGenMu.Unlock()
+
+	c.fieldGen[field].issued++
+
+	return c.fieldGen[field].issued
+}
+
+// CompleteFieldPoll applies mut only if generation is strictly newer than
+// whatever last actually applied -- poll or event -- for field. A poll for
+// one field losing this race never affects any other field: an unrelated
+// field's event, or an unrelated field's poll completing first, cannot
+// discard this field's fresh, successful data.
+func (c *DeviceConnection) CompleteFieldPoll(field StatusField, generation uint64, mut func(*DeviceStatus)) bool {
+	c.fieldGenMu.Lock()
+
+	if generation <= c.fieldGen[field].applied {
+		c.fieldGenMu.Unlock()
+
+		return false
+	}
+
+	c.fieldGen[field].applied = generation
+	c.fieldGenMu.Unlock()
+
+	c.UpdateStatus(mut)
+
+	return true
+}
+
+// ApplyFieldEvent always applies mut -- a real-time push event is
+// authoritative evidence for field -- and invalidates any poll for field
+// that began before it, without touching any other field's ordering.
+func (c *DeviceConnection) ApplyFieldEvent(field StatusField, mut func(*DeviceStatus)) {
+	c.fieldGenMu.Lock()
+	c.fieldGen[field].issued++
+	c.fieldGen[field].applied = c.fieldGen[field].issued
+	c.fieldGenMu.Unlock()
+
+	c.UpdateStatus(mut)
+}
+
 // UpdateStatus atomically applies mut to a copy of the current status
 // and stores the result. If another goroutine updates the status while
 // mut runs, UpdateStatus retries with the newer status — so concurrent
@@ -164,26 +246,64 @@ func (c *DeviceConnection) BeginGroupRefresh() uint64 {
 	return c.groupGeneration
 }
 
-// ApplyPolledGroup stores a /getGroup result only when no newer poll or
-// groupUpdated event superseded it. Empty groups clear the current claim.
+// ApplyPolledGroup stores a /getGroup result only if no strictly newer
+// result (poll or event) has already applied. Empty groups clear the
+// current claim.
 func (c *DeviceConnection) ApplyPolledGroup(generation uint64, group *models.Group) bool {
 	c.groupMu.Lock()
 	defer c.groupMu.Unlock()
 
-	if generation != c.groupGeneration {
+	if generation <= c.groupAppliedGeneration {
 		return false
 	}
+
+	c.groupAppliedGeneration = generation
+
+	return c.replaceGroup(normalizeGroup(group), time.Time{})
+}
+
+// GroupGeneration reports the generation of the most recently applied group
+// result (poll or event). Callers use this to snapshot a baseline before
+// starting an async /getGroup read they only want to apply if nothing else
+// has changed group state in the meantime.
+func (c *DeviceConnection) GroupGeneration() uint64 {
+	c.groupMu.Lock()
+	defer c.groupMu.Unlock()
+
+	return c.groupAppliedGeneration
+}
+
+// ApplyPolledGroupIfBaseline stores a /getGroup result only if the applied
+// group generation is still exactly baseline, i.e. no poll or event has
+// applied since the caller captured that baseline via GroupGeneration. Unlike
+// ApplyPolledGroup, a caller here never minted its own generation up front,
+// so it cannot rely on "strictly newer" to detect a stale read -- an
+// unconditionally-incrementing generation would always look newer than a
+// baseline captured earlier, even when the read itself raced a fresher
+// event or poll to completion first.
+func (c *DeviceConnection) ApplyPolledGroupIfBaseline(baseline uint64, group *models.Group) bool {
+	c.groupMu.Lock()
+	defer c.groupMu.Unlock()
+
+	if c.groupAppliedGeneration != baseline {
+		return false
+	}
+
+	c.groupGeneration++
+	c.groupAppliedGeneration = c.groupGeneration
 
 	return c.replaceGroup(normalizeGroup(group), time.Time{})
 }
 
 // ApplyGroupEvent stores the newest groupUpdated event and invalidates all
-// in-flight /getGroup requests. Empty teardown events clear the current claim.
+// in-flight /getGroup requests, including ones that have not started yet.
+// Empty teardown events clear the current claim.
 func (c *DeviceConnection) ApplyGroupEvent(group *models.Group, activity time.Time) bool {
 	c.groupMu.Lock()
 	defer c.groupMu.Unlock()
 
 	c.groupGeneration++
+	c.groupAppliedGeneration = c.groupGeneration
 
 	return c.replaceGroup(normalizeGroup(group), activity)
 }

@@ -163,6 +163,45 @@ func TestGroupEventSupersedesInFlightPoll(t *testing.T) {
 	}
 }
 
+// TestPolledGroupAppliesAfterNewerRefreshStartFailsToApply guards against
+// invalidating by start order: a second poll starting (and never applying,
+// e.g. its own GetGroup failed) must not discard an earlier poll's
+// still-arriving successful result.
+func TestPolledGroupAppliesAfterNewerRefreshStartFailsToApply(t *testing.T) {
+	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
+	genA := conn.BeginGroupRefresh()
+	_ = conn.BeginGroupRefresh() // a second poll starts but never calls ApplyPolledGroup
+
+	if !conn.ApplyPolledGroup(genA, &models.Group{ID: "pair-1", MasterDeviceID: "master"}) {
+		t.Fatal("an older poll's successful result must still apply when nothing newer ever actually applied")
+	}
+
+	if got := conn.Status().Group; got == nil || got.ID != "pair-1" {
+		t.Fatalf("Group = %+v, want pair-1 applied", got)
+	}
+}
+
+// TestOlderPolledGroupRejectedAfterNewerPollApplies guards the original
+// protection this mechanism exists for: a genuinely newer successful poll
+// must not be clobbered by an older one arriving late.
+func TestOlderPolledGroupRejectedAfterNewerPollApplies(t *testing.T) {
+	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
+	genA := conn.BeginGroupRefresh()
+	genB := conn.BeginGroupRefresh()
+
+	if !conn.ApplyPolledGroup(genB, &models.Group{ID: "pair-new", MasterDeviceID: "master"}) {
+		t.Fatal("newer poll result should apply")
+	}
+
+	if conn.ApplyPolledGroup(genA, &models.Group{ID: "pair-stale", MasterDeviceID: "master"}) {
+		t.Fatal("an older poll's result arriving after a newer one already applied must be rejected")
+	}
+
+	if got := conn.Status().Group; got == nil || got.ID != "pair-new" {
+		t.Fatalf("Group = %+v, want pair-new preserved", got)
+	}
+}
+
 func TestEmptyGroupClearsCurrentClaim(t *testing.T) {
 	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
 	conn.SetStatus(&DeviceStatus{Group: &models.Group{ID: "pair-1"}})
@@ -206,6 +245,95 @@ func TestApplyGroupEventIgnoresRoleOrder(t *testing.T) {
 
 	if conn.ApplyGroupEvent(rightFirst, time.Now()) {
 		t.Fatal("reordered roles for the same pair must not report a change")
+	}
+}
+
+func TestFieldPollCannotOverwriteNewerFieldEvent(t *testing.T) {
+	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
+	poll := conn.BeginFieldPoll(FieldVolume)
+
+	conn.ApplyFieldEvent(FieldVolume, func(status *DeviceStatus) {
+		status.Volume = &models.Volume{ActualVolume: 99}
+	})
+
+	if conn.CompleteFieldPoll(FieldVolume, poll, func(status *DeviceStatus) {
+		status.Volume = &models.Volume{ActualVolume: 42}
+	}) {
+		t.Fatal("poll that began before a same-field event was applied")
+	}
+
+	if got := conn.Status().Volume; got == nil || got.ActualVolume != 99 {
+		t.Fatalf("field event was overwritten by older poll data: %+v", got)
+	}
+}
+
+func TestNewerFieldPollSupersedesOlderFieldPoll(t *testing.T) {
+	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
+	older := conn.BeginFieldPoll(FieldVolume)
+	newer := conn.BeginFieldPoll(FieldVolume)
+
+	if !conn.CompleteFieldPoll(FieldVolume, newer, func(status *DeviceStatus) {
+		status.Volume = &models.Volume{ActualVolume: 30}
+	}) {
+		t.Fatal("newer poll was not applied")
+	}
+
+	if conn.CompleteFieldPoll(FieldVolume, older, func(status *DeviceStatus) {
+		status.Volume = &models.Volume{ActualVolume: 10}
+	}) {
+		t.Fatal("older poll completed after a newer same-field poll was applied")
+	}
+
+	if got := conn.Status().Volume; got == nil || got.ActualVolume != 30 {
+		t.Fatalf("newer poll state was overwritten: %+v", got)
+	}
+}
+
+func TestDuplicateFieldEventStillInvalidatesOlderSameFieldPoll(t *testing.T) {
+	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
+	conn.SetStatus(&DeviceStatus{Volume: &models.Volume{ActualVolume: 25}})
+	poll := conn.BeginFieldPoll(FieldVolume)
+
+	conn.ApplyFieldEvent(FieldVolume, func(status *DeviceStatus) {
+		status.Volume = &models.Volume{ActualVolume: 25}
+		status.LastActivity = time.Now()
+	})
+
+	if conn.CompleteFieldPoll(FieldVolume, poll, func(status *DeviceStatus) {
+		status.Volume = &models.Volume{ActualVolume: 10}
+	}) {
+		t.Fatal("poll that preceded duplicate same-field event evidence was applied")
+	}
+}
+
+// TestUnrelatedFieldEventDoesNotInvalidateInFlightPoll guards the actual
+// production bug this per-field design replaces a connection-wide gate to
+// fix: a push event for one field must never discard a DIFFERENT field's
+// still-in-flight, ultimately-successful poll. Sources in particular has no
+// push event at all (see StatusField's doc comment) and would go stale
+// indefinitely under ordinary event traffic if this regressed.
+func TestUnrelatedFieldEventDoesNotInvalidateInFlightPoll(t *testing.T) {
+	conn := NewDeviceConnection(nil, &models.DeviceInfo{Name: "test"})
+	sourcesPoll := conn.BeginFieldPoll(FieldSources)
+
+	// An unrelated field's event fires while the Sources poll is still in
+	// flight.
+	conn.ApplyFieldEvent(FieldVolume, func(status *DeviceStatus) {
+		status.Volume = &models.Volume{ActualVolume: 50}
+	})
+
+	if !conn.CompleteFieldPoll(FieldSources, sourcesPoll, func(status *DeviceStatus) {
+		status.Sources = &models.Sources{}
+	}) {
+		t.Fatal("an unrelated field's event must not invalidate this field's in-flight poll")
+	}
+
+	if got := conn.Status().Sources; got == nil {
+		t.Fatal("Sources poll result was discarded by an unrelated field's event")
+	}
+
+	if got := conn.Status().Volume; got == nil || got.ActualVolume != 50 {
+		t.Fatalf("unrelated field event itself was lost: %+v", got)
 	}
 }
 

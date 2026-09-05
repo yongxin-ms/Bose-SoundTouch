@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -34,6 +35,7 @@ import (
 	"github.com/gesellix/bose-soundtouch/pkg/service/spotify"
 	"github.com/gesellix/bose-soundtouch/pkg/service/stockholm"
 	"github.com/gesellix/bose-soundtouch/pkg/service/updatecheck"
+	"github.com/gesellix/bose-soundtouch/pkg/stereopair"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/urfave/cli/v2"
@@ -1504,6 +1506,38 @@ func newEmbeddedWebApp(server *handlers.Server, serverURL, internalURL string, d
 		return err
 	}
 
+	// Preserve the datastore's atomic, all-account guarantees for speakers that
+	// point at this service, while following fresh /info to an external Marge
+	// backend for speakers still managed by SoundCork or another service.
+	cleanup, preflight, rename := embeddedStereoPairGenerationPersistence(
+		ds,
+		func() []string {
+			localServerURL, localHTTPSServerURL := server.GetSettings()
+			return []string{localServerURL, localHTTPSServerURL}
+		},
+		func(margeURL string) bool {
+			if !server.DNSHijackEnabled() {
+				return false
+			}
+
+			parsed, err := url.Parse(strings.TrimSpace(margeURL))
+			if err != nil || parsed.Hostname() == "" {
+				return false
+			}
+
+			host := parsed.Hostname()
+			for _, hijacked := range discovery.InterceptedBoseHosts {
+				if strings.Contains(host, hijacked) {
+					return true
+				}
+			}
+
+			return false
+		},
+		&http.Client{Timeout: stereopair.RequestTimeout},
+	)
+	webApp.SetStereoPairGenerationPersistence(cleanup, preflight, rename)
+
 	// Keep the UI registry live as the service discovers or devices are added.
 	server.SetDevicesChangedHook(func() {
 		webApp.SeedExtraDevices()
@@ -1529,6 +1563,98 @@ func newEmbeddedWebApp(server *handlers.Server, serverURL, internalURL string, d
 	}()
 
 	return webApp
+}
+
+func embeddedStereoPairGenerationPersistence(
+	ds *datastore.DataStore,
+	localMargeURLs func() []string,
+	dnsHijackedMargeHost func(margeURL string) bool,
+	httpClient *http.Client,
+) (stereopair.GenerationCleanup, stereopair.GenerationPreflight, stereopair.GenerationRename) {
+	isLocal := func(margeURL string, localURLs []string) bool {
+		for _, localURL := range localURLs {
+			if stereopair.SameMargeBackend(margeURL, localURL) {
+				return true
+			}
+		}
+
+		// DNS-level migration never changes a speaker's own reported
+		// MargeURL -- only how that Bose hostname resolves on the network --
+		// so a speaker reporting e.g. https://streaming.bose.com can still be
+		// pointed at this very service. Treating it as "external" instead
+		// sends the generation-conflict check out over the real internet,
+		// where Bose's still-live Apigee gateway rejects it (HTTP 401),
+		// hard-blocking Create for a normal DNS-migrated setup.
+		return dnsHijackedMargeHost(margeURL)
+	}
+
+	cleanup := func(ref stereopair.GenerationRef) error {
+		if isLocal(ref.MargeURL, localMargeURLs()) {
+			err := ds.DeleteGroupGenerationForDevice(ref.DeviceID, ref.GroupID, ref.ExpectedGroup)
+			if errors.Is(err, datastore.ErrGroupDeleteAmbiguous) {
+				return fmt.Errorf("%w: %w", stereopair.ErrConflict, err)
+			}
+
+			return err
+		}
+
+		// The speaker itself self-reports its own group teardown to
+		// whatever Marge backend it's configured with -- that's the entire
+		// reason HandleMargeDeleteGroup/HandleMargeDeleteAccountGroups
+		// exist, they're only ever called by speakers, never by us.
+		// Nothing for us to push to a backend we don't own.
+		return nil
+	}
+
+	preflight := func(refs []stereopair.GenerationRef) error {
+		localURLs := localMargeURLs()
+		localDeviceIDs := make([]string, 0, len(refs))
+		externalRefs := make([]stereopair.GenerationRef, 0, len(refs))
+
+		for i := range refs {
+			if isLocal(refs[i].MargeURL, localURLs) {
+				localDeviceIDs = append(localDeviceIDs, refs[i].DeviceID)
+			} else {
+				externalRefs = append(externalRefs, refs[i])
+			}
+		}
+
+		if len(localDeviceIDs) > 0 {
+			if err := ds.EnsureNoGroupsForDevices(localDeviceIDs); err != nil {
+				return err
+			}
+		}
+
+		if len(externalRefs) > 0 {
+			// Best-effort dangling-generation check against a backend we
+			// don't own (real Bose cloud, another AfterTouch/SoundCork
+			// instance, ...): attempt it, but never let it being
+			// unreachable or unauthenticated block a Create the
+			// coordinator's own physical preflight already verified safe.
+			if err := stereopair.EnsureMargeNoGroupGenerations(httpClient, externalRefs); err != nil {
+				log.Printf("Stereo-pair external generation preflight inconclusive, proceeding: %v", err)
+			}
+		}
+
+		return nil
+	}
+
+	rename := func(ref stereopair.GenerationRef, name string) error {
+		if isLocal(ref.MargeURL, localMargeURLs()) {
+			_, err := ds.RenameGroupGenerationForDevice(ref.DeviceID, ref.GroupID, ref.ExpectedGroup, name)
+			if errors.Is(err, datastore.ErrGroupNotFound) || errors.Is(err, datastore.ErrGroupDeleteAmbiguous) {
+				return fmt.Errorf("%w: %w", stereopair.ErrConflict, err)
+			}
+
+			return err
+		}
+
+		// See cleanup's comment above: the speaker self-reports its own
+		// rename to whatever Marge backend it's configured with.
+		return nil
+	}
+
+	return cleanup, preflight, rename
 }
 
 func setupRouter(server *handlers.Server, stockholmHandler *stockholm.Handler, webApp *soundtouchweb.WebApp) *chi.Mux {

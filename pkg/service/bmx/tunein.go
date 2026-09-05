@@ -393,20 +393,12 @@ func tuneInSearchSection(item map[string]interface{}, idx int, query, layout str
 
 	// Pivots.More.Url is the "load more" cursor from the TuneIn profiles API.
 	// It is only present when there are more results beyond the first page.
-	if pivots, ok := item["Pivots"].(map[string]interface{}); ok {
-		if more, ok := pivots["More"].(map[string]interface{}); ok {
-			if containerURL, _ := more["Url"].(string); strings.Contains(containerURL, "itemToken") {
-				if u, err := url.Parse(containerURL); err == nil && allowedTuneInHosts[u.Hostname()] {
-					encoded := base64.RawURLEncoding.EncodeToString([]byte(containerURL))
-
-					if section.Links == nil {
-						section.Links = &models.Links{}
-					}
-
-					section.Links.BmxNext = &models.Link{Href: "/v1/search/next?cursor=" + encoded}
-				}
-			}
+	if next := tuneInMoreCursorLink(item); next != nil {
+		if section.Links == nil {
+			section.Links = &models.Links{}
 		}
+
+		section.Links.BmxNext = next
 	}
 
 	for _, child := range children {
@@ -432,6 +424,36 @@ func tuneInSearchSection(item map[string]interface{}, idx int, query, layout str
 	}
 
 	return section
+}
+
+// tuneInMoreCursorLink builds a BmxNext pagination link from item's
+// Pivots.More.Url, the "load more" cursor the TuneIn search/profiles API
+// attaches once there are more results than fit on the first page. Returns
+// nil if there's nothing more to load.
+func tuneInMoreCursorLink(item map[string]interface{}) *models.Link {
+	pivots, ok := item["Pivots"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	more, ok := pivots["More"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	containerURL, _ := more["Url"].(string)
+	if !strings.Contains(containerURL, "itemToken") {
+		return nil
+	}
+
+	u, err := url.Parse(containerURL)
+	if err != nil || !allowedTuneInHosts[u.Hostname()] {
+		return nil
+	}
+
+	encoded := base64.RawURLEncoding.EncodeToString([]byte(containerURL))
+
+	return &models.Link{Href: "/v1/search/next?cursor=" + encoded}
 }
 
 // TuneInSearchNext fetches the remaining results for a section using the opaque
@@ -552,7 +574,7 @@ func tuneInSearchProfile(item map[string]interface{}, _ string) models.BmxNavIte
 	// Artists/Stations/etc are typically navigated first.
 	if typeStr, _ := item["Type"].(string); typeStr == "Program" {
 		if guideID, _ := item["GuideId"].(string); guideID != "" {
-			encodedName := base64.URLEncoding.EncodeToString([]byte(profileName))
+			encodedName := base64.RawURLEncoding.EncodeToString([]byte(profileName))
 			playbackHref := fmt.Sprintf("/v1/playback/episodes/%s?encoded_name=%s", guideID, encodedName)
 
 			return models.BmxNavItem{
@@ -565,7 +587,7 @@ func tuneInSearchProfile(item map[string]interface{}, _ string) models.BmxNavIte
 						Type: "tracklisturl",
 					},
 					BmxNavigate: &models.Link{
-						Href: "/v1/navigate/profiles/" + base64.URLEncoding.EncodeToString([]byte(href)),
+						Href: "/v1/navigate/profiles/" + base64.RawURLEncoding.EncodeToString([]byte(href)),
 					},
 				},
 			}
@@ -600,25 +622,39 @@ func TuneInNavigateProfile(encodedURI string) (*models.BmxNavResponse, error) {
 
 	navResp := &models.BmxNavResponse{
 		Links: &models.Links{
-			Self: &models.Link{Href: "/v1/navigate/profile/" + encodedURI},
+			Self: &models.Link{Href: "/v1/navigate/profiles/" + encodedURI},
 		},
 		Layout: "classic",
 	}
 
-	// Profiles contain "pivots" (sections like "Programs", "Related", etc.)
-	pivots, _ := data["pivots"].([]interface{})
-	for _, p := range pivots {
+	// The profiles API (api.radiotime.com/profiles/...) nests everything under
+	// "Item", and its pivots ("Contents", "Related", etc.) are an *object*
+	// keyed by pivot name, e.g.:
+	//   {"Item": {..., "Pivots": {"Contents": {"DisplayName": "Broadcasts", "Url": "..."}}}}
+	// (Earlier code assumed a top-level "pivots" array with "text"/"URL"
+	// fields, which never matched this response and left bmx_sections empty.)
+	item, _ := data["Item"].(map[string]interface{})
+	pivots, _ := item["Pivots"].(map[string]interface{})
+
+	for pivotName, p := range pivots {
+		// We only care about the "Contents" pivot for now (the main list).
+		if !strings.EqualFold(pivotName, "contents") {
+			continue
+		}
+
 		pivot, ok := p.(map[string]interface{})
 		if !ok {
 			continue
 		}
 
-		pivotName, _ := pivot["text"].(string)
-		pivotURL, _ := pivot["URL"].(string)
-
-		// We only care about the "Contents" pivot for now (the main list)
-		if !strings.EqualFold(pivotName, "contents") {
+		pivotURL, _ := pivot["Url"].(string)
+		if pivotURL == "" {
 			continue
+		}
+
+		displayName, _ := pivot["DisplayName"].(string)
+		if displayName == "" {
+			displayName = pivotName
 		}
 
 		contents, err := fetchJSON(tuneInRenderJSONURI(pivotURL))
@@ -626,18 +662,111 @@ func TuneInNavigateProfile(encodedURI string) (*models.BmxNavResponse, error) {
 			return nil, err
 		}
 
-		body, _ := contents["body"].([]interface{})
-		for idx, item := range body {
-			m, ok := item.(map[string]interface{})
+		// "Items" (v1.3 profiles/search API) first, then "body" (legacy/OPML).
+		rawItems, ok := contents["Items"].([]interface{})
+		if !ok {
+			rawItems, _ = contents["body"].([]interface{})
+		}
+
+		// The Contents pivot doesn't return playable items directly: each
+		// top-level entry is a "Container" (identified by a "ContainerType"
+		// field, e.g. GuideId "v5", Title "Episodes") whose real payload is
+		// its own "Children" (or legacy lowercase "children") array. A
+		// Container also carries a "Pivots.More" cursor once there are more
+		// children than fit on this page. Build one BmxNavSection per
+		// container (falling back to treating the entry itself as a leaf
+		// item only when it isn't a Container at all, in case some profile
+		// types ever return a flat list here).
+		for _, raw := range rawItems {
+			m, ok := raw.(map[string]interface{})
 			if !ok {
 				continue
 			}
 
-			navResp.BmxSections = append(navResp.BmxSections, tuneInSearchSection(m, idx, "", "list"))
+			children, hasChildren := m["Children"].([]interface{})
+			if !hasChildren {
+				children, hasChildren = m["children"].([]interface{})
+			}
+
+			if !hasChildren || len(children) == 0 {
+				if _, isContainer := m["ContainerType"].(string); isContainer {
+					// An empty container (e.g. no episodes published yet)
+					// has nothing playable to show; skip it rather than
+					// mistakenly treating its own GuideId (which identifies
+					// the container, not a track) as a playback link.
+					continue
+				}
+
+				navResp.BmxSections = append(navResp.BmxSections, models.BmxNavSection{
+					Name:   displayName,
+					Layout: "list",
+					Items:  []models.BmxNavItem{tuneInProfileNavItem(m)},
+				})
+
+				continue
+			}
+
+			sectionName, _ := m["Title"].(string)
+			if sectionName == "" {
+				sectionName = displayName
+			}
+
+			navItems := make([]models.BmxNavItem, 0, len(children))
+
+			for _, child := range children {
+				cm, ok := child.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				navItems = append(navItems, tuneInProfileNavItem(cm))
+			}
+
+			section := models.BmxNavSection{
+				Name:   sectionName,
+				Layout: "list",
+				Items:  navItems,
+			}
+
+			if next := tuneInMoreCursorLink(m); next != nil {
+				section.Links = &models.Links{BmxNext: next}
+			}
+
+			navResp.BmxSections = append(navResp.BmxSections, section)
 		}
 	}
 
 	return navResp, nil
+}
+
+// tuneInProfileNavItem maps a single item found under a profile's Contents
+// pivot (or one of a Container's Children) to a BmxNavItem, based on its
+// TuneIn "Type".
+func tuneInProfileNavItem(m map[string]interface{}) models.BmxNavItem {
+	typeStr, _ := m["Type"].(string)
+
+	switch typeStr {
+	case "Program", "Profile":
+		name, _ := m["Title"].(string)
+
+		return tuneInSearchProfile(m, name)
+	default:
+		// "Topic" (individual on-demand episodes/broadcasts), "Station",
+		// "PlayItem", and anything else are all directly playable by their
+		// own GuideId via Tune.ashx, so they share tuneInSearchPlayItem's
+		// /v1/playback/station/{GuideId} link.
+		//
+		// This intentionally does NOT use /v1/playback/episodes/{GuideId}
+		// (tracklisturl): that route is backed by TuneInPodcastInfo, which
+		// is a stub that always returns an empty track list (see its
+		// doc comment) - a speaker given that location has nothing to
+		// play. /v1/playback/station/{GuideId} (bmx.TuneInPlayback) is the
+		// one path in this codebase proven to resolve a raw TuneIn GuideId
+		// - including a "t"-prefixed topic id - to an actual stream, via
+		// Tune.ashx; resolveTuneInProgramLatestEpisode+TuneInPlayback uses
+		// the exact same call for a program's latest topic.
+		return tuneInSearchPlayItem(m)
+	}
 }
 
 func parseTuneInStreamBody(body []byte, guideID string) ([]string, error) {

@@ -4,6 +4,7 @@ package soundtouchweb
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,10 +14,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gesellix/bose-soundtouch/pkg/client"
 	"github.com/gesellix/bose-soundtouch/pkg/models"
 	bmxpkg "github.com/gesellix/bose-soundtouch/pkg/service/bmx"
 	"github.com/gesellix/bose-soundtouch/pkg/service/soundtouchweb/webtypes"
 	"github.com/gesellix/bose-soundtouch/pkg/service/stations"
+	"github.com/gesellix/bose-soundtouch/pkg/stereopair"
 	"github.com/go-chi/chi/v5"
 	"github.com/gorilla/websocket"
 )
@@ -33,9 +36,39 @@ type WebApp struct {
 	devicesMu sync.RWMutex
 	devices   map[string]*webtypes.DeviceConnection
 
-	Upgrader  websocket.Upgrader
-	WSClients map[*websocket.Conn]bool
+	Upgrader websocket.Upgrader
+	// WSClients maps each registered browser WebSocket connection to its own
+	// write-serialization lock (see withConnWrite). Gorilla permits only one
+	// concurrent writer per connection; keying the lock per-connection means
+	// a stalled client's write can never block a write to any OTHER
+	// connection, unlike a single application-wide write lock would.
+	WSClients map[*websocket.Conn]*sync.Mutex
 	WSMutex   sync.RWMutex
+	// DeviceWSClients mirrors WSClients but for HandleDeviceWebSocket's
+	// per-device status connections (see withDeviceConnWrite). Keyed by the
+	// webSocketWriter interface rather than *websocket.Conn so tests can
+	// register a mock writer the same way production code registers a real
+	// connection. awaitPriorGlobalWebSocketWrites barriers against both
+	// pools uniformly.
+	DeviceWSClients map[webSocketWriter]*sync.Mutex
+	DeviceWSMutex   sync.RWMutex
+	// discoveryPublishMu serializes discoveryStatus publications against
+	// each other only (Store + client snapshot + fan-out stay ordered across
+	// concurrent BroadcastDiscoveryStatus calls). It is deliberately NOT
+	// shared with connection registration: a newly-registering connection
+	// reads whatever discoveryStatus.Load() currently returns and is never
+	// blocked by an in-flight publication. This is safe because Store()
+	// always commits before a publication takes its client snapshot, so a
+	// registration racing a publication sees either the prior or the new
+	// value -- never something older than what was last actually stored.
+	discoveryPublishMu sync.Mutex
+	// webSocketWriteTimeout bounds each browser WebSocket write so one stalled
+	// client cannot indefinitely block updates for healthy clients.
+	webSocketWriteTimeout time.Duration
+
+	deviceBroadcastMu      sync.Mutex
+	deviceBroadcastPending bool
+	deviceBroadcastRunning bool
 
 	Version    string
 	Commit     string
@@ -88,6 +121,11 @@ type WebApp struct {
 	// SeedExtraDevices never probe the same still-offline host concurrently.
 	seedMu sync.Mutex
 
+	// StereoPairs coordinates persistent ST10 stereo-pair mutations across
+	// both physical speakers. It is shared for the lifetime of WebApp so its
+	// mutation lock covers concurrent CLI-like requests from every browser.
+	StereoPairs StereoPairLifecycle
+
 	discoveryStatus atomic.Value // stores *webtypes.DiscoveryStatus
 }
 
@@ -124,13 +162,89 @@ type DeviceEntry struct {
 
 // NewWebApp creates a new WebApp instance for SPA mode
 func NewWebApp() *WebApp {
-	return &WebApp{
-		devices:   make(map[string]*webtypes.DeviceConnection),
-		WSClients: make(map[*websocket.Conn]bool),
+	app := &WebApp{
+		devices:         make(map[string]*webtypes.DeviceConnection),
+		WSClients:       make(map[*websocket.Conn]*sync.Mutex),
+		DeviceWSClients: make(map[webSocketWriter]*sync.Mutex),
 		Upgrader: websocket.Upgrader{
-			CheckOrigin: func(_ *http.Request) bool { return true },
+			CheckOrigin: checkWebSocketOrigin,
 		},
 	}
+	cleanup, preflight, rename := playerStereoPairGenerationPersistence(app.stereoPairPersistenceClient)
+	app.StereoPairs = stereopair.NewWithGenerationLifecyclePersistence(app.stereoPairClient, cleanup, preflight, rename)
+
+	return app
+}
+
+// playerStereoPairGenerationPersistence wires generation-lifecycle hooks for
+// contexts with no local datastore of their own (the standalone player, and
+// the player component embedded in -service before SetStereoPairGenerationPersistence
+// overrides it): cleanup and rename are no-ops, and preflight's read-only
+// dangling-generation check is advisory.
+//
+// A speaker self-reports its own group create/rename/teardown to whatever
+// Marge backend it's configured with -- that's the entire reason
+// HandleMargeAddGroup/HandleMargeModifyGroup/HandleMargeDeleteGroup exist,
+// they're only ever called by speakers, never by us. Proactively pushing the
+// same update ourselves would duplicate that against a backend we generally
+// can't authenticate to anyway (real Bose cloud, another AfterTouch/SoundCork
+// instance, ...). The one part with a distinct purpose -- checking for a
+// dangling stale generation before a new Create -- is still attempted, but
+// its failure must not block Create: it's a best-effort safety net on top of
+// the coordinator's own physical preflight, not the primary guard.
+func playerStereoPairGenerationPersistence(
+	persistenceClient func() *http.Client,
+) (stereopair.GenerationCleanup, stereopair.GenerationPreflight, stereopair.GenerationRename) {
+	cleanup := func(stereopair.GenerationRef) error {
+		return nil
+	}
+
+	preflight := func(refs []stereopair.GenerationRef) error {
+		if err := stereopair.EnsureMargeNoGroupGenerations(persistenceClient(), refs); err != nil {
+			log.Printf("Stereo-pair external generation preflight inconclusive, proceeding: %v", err)
+		}
+
+		return nil
+	}
+
+	rename := func(stereopair.GenerationRef, string) error {
+		return nil
+	}
+
+	return cleanup, preflight, rename
+}
+
+func (app *WebApp) stereoPairPersistenceClient() *http.Client {
+	base := app.serviceHTTPClient()
+	if base.Timeout >= stereopair.RequestTimeout {
+		return base
+	}
+
+	configured := *base
+	configured.Timeout = stereopair.RequestTimeout
+
+	return &configured
+}
+
+// SetStereoPairGenerationPersistence overrides both exact post-teardown
+// retirement and the read-only pre-create generation barrier.
+func (app *WebApp) SetStereoPairGenerationPersistence(
+	cleanup stereopair.GenerationCleanup,
+	preflight stereopair.GenerationPreflight,
+	rename stereopair.GenerationRename,
+) {
+	app.StereoPairs = stereopair.NewWithGenerationLifecyclePersistence(app.stereoPairClient, cleanup, preflight, rename)
+}
+
+// stereoPairClient uses a dedicated long-timeout client. Pair creation can
+// legitimately span multiple 15-second speaker/Marge retry cycles, while the
+// ordinary status clients intentionally use a shorter timeout.
+func (app *WebApp) stereoPairClient(host string) (stereopair.Client, error) {
+	if strings.TrimSpace(host) == "" {
+		return nil, fmt.Errorf("speaker host is empty")
+	}
+
+	return client.NewClient(&client.Config{Host: host, Timeout: stereopair.RequestTimeout}), nil
 }
 
 // GetDevice returns the device for id and whether it exists.
@@ -288,14 +402,21 @@ func (app *WebApp) HandleAPIDevice(w http.ResponseWriter, r *http.Request) {
 		go app.ConnectDeviceWebSocket(deviceID, device)
 	}
 
+	// Route through the same stereo-pair projection as HandleAPIDevices and
+	// the WebSocket frames. A hidden pair member is exactly as unaddressable
+	// here as it is from the list -- otherwise it would be absent from
+	// "devices" but still fully fetchable, unprojected, by its own id.
+	view, visible := app.deviceViewForID(deviceID)
+	if !visible {
+		app.sendError(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 
 	response := webtypes.APIResponse{
 		Success: true,
-		Data: map[string]interface{}{
-			"info":   device.DeviceInfo,
-			"status": device.Status(),
-		},
+		Data:    view,
 	}
 
 	if err := json.NewEncoder(w).Encode(response); err != nil {
@@ -723,31 +844,64 @@ func (app *WebApp) HandleDevicePowerStatus(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-// BroadcastDeviceList sends updated device list to all connected WebSocket clients
+// BroadcastDeviceList sends updated device list to all connected WebSocket
+// clients. Each client is written under only its own connection lock (see
+// withConnWrite), so a stalled/backgrounded client can never block this
+// call -- including when it runs synchronously from an HTTP handler such as
+// HandleDeleteDevice -- from delivering to every other, healthy client.
 func (app *WebApp) BroadcastDeviceList() {
-	app.WSMutex.RLock()
-	defer app.WSMutex.RUnlock()
-
 	message := webtypes.WebSocketMessage{
 		Type: "devices",
 		Data: app.deviceViewSnapshot(),
 	}
 
-	// Send to all connected clients
-	var failedClients []*websocket.Conn
+	for _, client := range app.globalWebSocketClients() {
+		if err := app.withConnWrite(client, func(batch webSocketWriteBatch) error {
+			return batch.writeJSON(client, message)
+		}); err != nil {
+			if !errors.Is(err, errConnUnregistered) {
+				log.Printf("Failed to send device update to WebSocket client: %v", err)
+			}
 
-	for client := range app.WSClients {
-		if err := client.WriteJSON(message); err != nil {
-			log.Printf("Failed to send device update to WebSocket client: %v", err)
-			// Mark for removal to avoid modifying map during iteration
-			failedClients = append(failedClients, client)
+			app.removeGlobalWebSocketClient(client)
 		}
 	}
+}
 
-	// Remove failed clients
-	for _, client := range failedClients {
-		delete(app.WSClients, client)
-		client.Close()
+// QueueDeviceListBroadcast schedules one device projection without blocking a
+// speaker's event read loop on browser I/O. At most one worker runs per app;
+// events during a slow write are coalesced into one follow-up snapshot rather
+// than expanding into an unbounded queue or set of goroutines.
+func (app *WebApp) QueueDeviceListBroadcast() {
+	app.deviceBroadcastMu.Lock()
+
+	app.deviceBroadcastPending = true
+	if app.deviceBroadcastRunning {
+		app.deviceBroadcastMu.Unlock()
+
+		return
+	}
+
+	app.deviceBroadcastRunning = true
+	app.deviceBroadcastMu.Unlock()
+
+	go app.runDeviceListBroadcasts()
+}
+
+func (app *WebApp) runDeviceListBroadcasts() {
+	for {
+		app.deviceBroadcastMu.Lock()
+		if !app.deviceBroadcastPending {
+			app.deviceBroadcastRunning = false
+			app.deviceBroadcastMu.Unlock()
+
+			return
+		}
+
+		app.deviceBroadcastPending = false
+		app.deviceBroadcastMu.Unlock()
+
+		app.BroadcastDeviceList()
 	}
 }
 
@@ -765,32 +919,29 @@ func (app *WebApp) BroadcastDiscoveryStatus(status string, deviceCount int) {
 		discoveryStatus.IsDiscovering = false
 	}
 
-	app.discoveryStatus.Store(discoveryStatus)
-
-	app.WSMutex.RLock()
-	defer app.WSMutex.RUnlock()
-
-	message := webtypes.WebSocketMessage{
-		Type: "discovery_status",
-		Data: discoveryStatus,
-	}
-
-	// Send to all connected clients
-	var failedClients []*websocket.Conn
-
-	for client := range app.WSClients {
-		if err := client.WriteJSON(message); err != nil {
-			log.Printf("Failed to send discovery status to WebSocket client: %v", err)
-			// Mark for removal to avoid modifying map during iteration
-			failedClients = append(failedClients, client)
+	_ = app.withDiscoveryStatusWrite(discoveryStatus, func(
+		_ webSocketWriteBatch,
+		clients []*websocket.Conn,
+	) error {
+		message := webtypes.WebSocketMessage{
+			Type: "discovery_status",
+			Data: discoveryStatus,
 		}
-	}
 
-	// Remove failed clients
-	for _, client := range failedClients {
-		delete(app.WSClients, client)
-		client.Close()
-	}
+		for _, client := range clients {
+			if err := app.withConnWrite(client, func(batch webSocketWriteBatch) error {
+				return batch.writeJSON(client, message)
+			}); err != nil {
+				if !errors.Is(err, errConnUnregistered) {
+					log.Printf("Failed to send discovery status to WebSocket client: %v", err)
+				}
+
+				app.removeGlobalWebSocketClient(client)
+			}
+		}
+
+		return nil
+	})
 }
 
 // HandleTuneInSearch handles TuneIn search requests, proxying directly to the bmx package.
@@ -840,7 +991,7 @@ func (app *WebApp) HandleTuneInSearchNext(w http.ResponseWriter, r *http.Request
 //   - (empty)                             → top-level browse
 //   - /{encodedURI}                       → browse the given TuneIn URI
 //   - /sub/{n}/{encodedURI}               → single subsection
-//   - /profiles/{type}/{id}/{encodedURI}  → artist/program profile
+//   - /profiles/{encodedURI}              → artist/program profile
 func (app *WebApp) HandleTuneInNavigate(w http.ResponseWriter, r *http.Request) {
 	wildcard := chi.URLParam(r, "*")
 
@@ -955,7 +1106,12 @@ func (app *WebApp) HandleGetZone(w http.ResponseWriter, r *http.Request) {
 // becomes the master.
 func (app *WebApp) HandleZoneAdd(w http.ResponseWriter, r *http.Request) {
 	masterIP := chi.URLParam(r, "id")
+
 	slaveIP := chi.URLParam(r, "slaveId")
+	if masterIP == slaveIP {
+		app.sendError(w, "A device cannot be added to its own zone", http.StatusBadRequest)
+		return
+	}
 
 	masterConn, ok := app.GetDevice(masterIP)
 	if !ok {
@@ -971,6 +1127,28 @@ func (app *WebApp) HandleZoneAdd(w http.ResponseWriter, r *http.Request) {
 
 	if masterConn.Client == nil || masterConn.DeviceInfo == nil || slaveConn.DeviceInfo == nil {
 		app.sendError(w, "Device not ready", http.StatusInternalServerError)
+		return
+	}
+
+	if masterConn.DeviceInfo.DeviceID == slaveConn.DeviceInfo.DeviceID {
+		app.sendError(w, "A device cannot be added to its own zone", http.StatusBadRequest)
+		return
+	}
+
+	nowPlaying, err := masterConn.Client.GetNowPlaying()
+	if err != nil {
+		app.sendError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	sources, err := masterConn.Client.GetSources()
+	if err != nil {
+		app.sendError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if !currentSourceAllowsMultiroom(nowPlaying, sources) {
+		app.sendError(w, "Start a multiroom-capable source before grouping speakers", http.StatusConflict)
 		return
 	}
 
@@ -994,6 +1172,27 @@ func (app *WebApp) HandleZoneAdd(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	app.sendControlResponse(w, masterConn.Client.SetZone(zoneReq), "Device added to zone")
+}
+
+func currentSourceAllowsMultiroom(nowPlaying *models.NowPlaying, sources *models.Sources) bool {
+	if nowPlaying == nil || sources == nil {
+		return false
+	}
+
+	source := strings.TrimSpace(nowPlaying.Source)
+	if source == "" || source == "STANDBY" || source == "INVALID_SOURCE" {
+		return false
+	}
+
+	for i := range sources.SourceItem {
+		item := &sources.SourceItem[i]
+		if item.Source == source && item.MultiroomAllowed &&
+			(nowPlaying.SourceAccount == "" || item.SourceAccount == nowPlaying.SourceAccount) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // HandleZoneRemove removes a slave from the zone.
