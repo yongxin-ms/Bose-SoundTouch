@@ -3,6 +3,7 @@ package soundtouchweb
 import (
 	"context"
 	"log"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/gesellix/bose-soundtouch/pkg/client"
 	"github.com/gesellix/bose-soundtouch/pkg/config"
 	"github.com/gesellix/bose-soundtouch/pkg/discovery"
+	"github.com/gesellix/bose-soundtouch/pkg/models"
 	"github.com/gesellix/bose-soundtouch/pkg/service/soundtouchweb/webtypes"
 	"github.com/gesellix/bose-soundtouch/pkg/speaker"
 )
@@ -64,10 +66,15 @@ func NewDiscoveryService(discoveryInterface string, configuredHosts ...string) *
 // mDNS/UPnP. If the host is already known, the existing entry's
 // LastSeen is bumped and the function returns without re-fetching.
 func (app *WebApp) AddDeviceByHost(host string, port int, source string) {
-	app.addDeviceByHost(host, port, source)
+	app.addDeviceByHost(context.Background(), host, port, source)
 }
 
-func (app *WebApp) addDeviceByHost(host string, port int, source string) *webtypes.DeviceConnection {
+func (app *WebApp) addDeviceByHost(
+	ctx context.Context,
+	host string,
+	port int,
+	source string,
+) *webtypes.DeviceConnection {
 	// Fast path: skip the network call if we already know this host.
 	if app.TouchDevice(host) {
 		return nil
@@ -85,12 +92,13 @@ func (app *WebApp) addDeviceByHost(host string, port int, source string) *webtyp
 		return nil
 	}
 
-	// Ensure IPAddress is set for the web UI
-	if info.IPAddress == "" {
-		info.IPAddress = host
-	}
+	// Keep the registry key stable for controls, but expose a canonical numeric
+	// address separately for presentation and sorting.
+	info.IPAddress = resolvedDeviceIPAddress(ctx, host, info)
 
 	conn := webtypes.NewDeviceConnection(c, info)
+	conn.MarkHTTPSuccess(time.Now())
+
 	if !app.AddDevice(host, conn) {
 		// Lost a race — another goroutine inserted the same host
 		// between TouchDevice and AddDevice. AddDevice bumped LastSeen
@@ -122,6 +130,44 @@ func (app *WebApp) addDeviceByHost(host string, port int, source string) *webtyp
 	return conn
 }
 
+func resolvedDeviceIPAddress(ctx context.Context, host string, info *models.DeviceInfo) string {
+	if info != nil {
+		if address := numericIPAddress(info.IPAddress); address != "" {
+			return address
+		}
+
+		for _, network := range info.NetworkInfo {
+			if address := numericIPAddress(network.IPAddress); address != "" {
+				return address
+			}
+		}
+	}
+
+	bareHost := hostOnly(host)
+	if address := numericIPAddress(bareHost); address != "" {
+		return address
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip4", bareHost)
+	if err == nil && len(addresses) > 0 {
+		return addresses[0].String()
+	}
+
+	return ""
+}
+
+func numericIPAddress(address string) string {
+	ip := net.ParseIP(strings.TrimSpace(address))
+	if ip == nil {
+		return ""
+	}
+
+	return ip.String()
+}
+
 // SeedExtraDevices registers any devices reported by the ExtraDeviceHosts hook
 // (if set) via AddDeviceByHost, and prunes any previously-seeded host that no
 // longer appears in that set. Idempotent: already-known hosts are skipped.
@@ -138,7 +184,7 @@ func (app *WebApp) addDeviceByHost(host string, port int, source string) *webtyp
 // need to distinguish "read failed" from "converged" (the bounded startup
 // retry) should call seedExtraDevices directly instead.
 func (app *WebApp) SeedExtraDevices() {
-	if _, _, _, err := app.seedExtraDevices(); err != nil {
+	if _, _, _, err := app.seedExtraDevices(context.Background()); err != nil {
 		log.Printf("SeedExtraDevices: failed to read extra device hosts: %v", err)
 	}
 }
@@ -163,7 +209,9 @@ type seededExtraDevice struct {
 // A non-nil error means the hook itself failed (e.g. a datastore glitch);
 // callers must treat that as "unknown state, don't prune, don't declare
 // ready" rather than as an empty desired set.
-func (app *WebApp) seedExtraDevices() (inserted []seededExtraDevice, removed int, desired map[string]struct{}, err error) {
+func (app *WebApp) seedExtraDevices(
+	ctx context.Context,
+) (inserted []seededExtraDevice, removed int, desired map[string]struct{}, err error) {
 	if app.ExtraDeviceHosts == nil {
 		return nil, 0, nil, nil
 	}
@@ -191,7 +239,7 @@ func (app *WebApp) seedExtraDevices() (inserted []seededExtraDevice, removed int
 		go func(h string) {
 			defer wg.Done()
 
-			conn := app.addDeviceByHost(h, 8090, "service-store")
+			conn := app.addDeviceByHost(ctx, h, 8090, "service-store")
 			if conn == nil {
 				return
 			}
@@ -226,7 +274,7 @@ func (app *WebApp) seedExtraDevices() (inserted []seededExtraDevice, removed int
 // while the service is starting.
 func (app *WebApp) SeedExtraDevicesUntilReady(ctx context.Context, retryInterval time.Duration) {
 	retryUntilReady(ctx, retryInterval, func() bool {
-		inserted, removed, desired, err := app.seedExtraDevices()
+		inserted, removed, desired, err := app.seedExtraDevices(ctx)
 		if err != nil {
 			log.Printf("SeedExtraDevicesUntilReady: failed to read extra device hosts, will retry: %v", err)
 			return false
@@ -333,7 +381,9 @@ func (app *WebApp) DiscoverDevices(ctx context.Context, discoveryService *discov
 
 	// Re-sync from the external device source (embedded: the service datastore).
 	// No-op when ExtraDeviceHosts is unset.
-	app.SeedExtraDevices()
+	if _, _, _, err := app.seedExtraDevices(ctx); err != nil {
+		log.Printf("DiscoverDevices: failed to read extra device hosts: %v", err)
+	}
 
 	// Own mDNS/UPnP sweep — standalone only. The embedded build passes a nil
 	// discovery service and relies entirely on the host service's discovery.
@@ -354,7 +404,7 @@ func (app *WebApp) DiscoverDevices(ctx context.Context, discoveryService *discov
 	log.Printf("Found %d devices", len(devices))
 
 	for _, device := range devices {
-		app.AddDeviceByHost(device.Host, device.Port, classifySource(device.DiscoveryMethod))
+		app.addDeviceByHost(ctx, device.Host, device.Port, classifySource(device.DiscoveryMethod))
 	}
 }
 
