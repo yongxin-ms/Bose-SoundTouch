@@ -700,11 +700,23 @@ img { display: block; max-width: 100%; }
     font-size: .8rem;
     transition: background .1s, border-color .1s;
 }
-.source-btn:hover { background: var(--bg); }
+.source-btn:hover:not(:disabled) { background: var(--bg); }
+.source-btn:disabled { cursor: not-allowed; opacity: .55; }
 .source-btn.active { border-color: var(--accent); background: var(--accent); color: var(--accent-fg); }
+.source-btn.pending { cursor: wait; }
+.source-btn.provisional-confirmed { border-style: dashed; cursor: progress; }
+.source-btn.unverified { border-color: #a76b00; }
+.source-btn.failed { border-color: var(--offline); }
 .source-btn.local { border-style: dashed; }
 .source-icon { font-size: .9rem; line-height: 1; }
 .source-name { font-weight: 500; }
+.source-command-status {
+    min-height: 1.2em;
+    margin-top: .35rem;
+    color: var(--text-dim);
+    font-size: .75rem;
+}
+.source-command-status.availability { color: #8a5a00; }
 
 .stereo-pair-note {
     display: flex;
@@ -987,6 +999,30 @@ img { display: block; max-width: 100%; }
 }
 
 /* ── Toast ───────────────────────────────────────────────────────────────── */
+/* ── Connection banner ───────────────────────────────────────────────────── */
+.connection-banner {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    padding: .5rem 1rem;
+    text-align: center;
+    font-size: .8125rem;
+    z-index: 300;
+    box-shadow: 0 2px 8px rgba(0,0,0,.2);
+    /* --stale is not redefined for dark mode, so pairing it with a fixed
+       near-black keeps the contrast readable in both themes. */
+    background: var(--stale);
+    color: #1a1a1a;
+}
+
+/* Opening the socket is not a problem worth an alarm colour. */
+.connection-banner.connecting {
+    background: var(--surface);
+    color: var(--text);
+    border-bottom: 1px solid var(--border);
+}
+
 .toast {
     position: fixed;
     bottom: 1.5rem;

@@ -54,6 +54,9 @@ type DeviceConnection struct {
 	deviceName atomic.Pointer[string]
 	status     atomic.Pointer[DeviceStatus]
 
+	// epoch stamps every status this connection publishes. See nextStatusEpoch.
+	epoch int64
+
 	webSocketMu          sync.RWMutex
 	webSocketLoopRunning atomic.Bool
 
@@ -75,6 +78,11 @@ type DeviceConnection struct {
 	speakerConnectionKnown     bool
 	speakerConnectionConnected bool
 	speakerConnectionObserved  time.Time
+
+	// sourcesFailuresMu guards consecutiveSourcesFailures, the count of
+	// /sources reads that have failed in a row. See ApplySourcesRead.
+	sourcesFailuresMu          sync.Mutex
+	consecutiveSourcesFailures int
 
 	// fieldGenMu guards fieldGen, the per-field generation ordering used by
 	// BeginFieldPoll/CompleteFieldPoll/ApplyFieldEvent. Each StatusField gets
@@ -111,6 +119,7 @@ type DeviceStatus struct {
 	Volume                 *models.Volume          `json:"volume,omitempty"`
 	Presets                *models.Presets         `json:"presets,omitempty"`
 	Sources                *models.Sources         `json:"sources,omitempty"`
+	SourcesStale           bool                    `json:"sourcesStale,omitempty"`
 	Bass                   *models.Bass            `json:"bass,omitempty"`
 	Group                  *models.Group           `json:"group,omitempty"`
 	Connectivity           Connectivity            `json:"connectivity"`
@@ -119,6 +128,22 @@ type DeviceStatus struct {
 	SpeakerConnectionState *SpeakerConnectionState `json:"speakerConnectionState,omitempty"`
 	IsConnected            bool                    `json:"isConnected"`
 	LastActivity           time.Time               `json:"lastActivity"`
+
+	// Epoch identifies the DeviceConnection that produced this status.
+	// Revision restarts at 0 for every new connection, so revisions from
+	// different epochs are not comparable; a client must compare Epoch first.
+	Epoch int64 `json:"epoch"`
+	// Revision is a per-connection monotonic counter advanced by every
+	// successful UpdateStatus. It lets the browser order a full `devices`
+	// snapshot against a `status_update` delta -- without it the two frames
+	// carry no sequence at all and a slow snapshot can clobber a newer delta.
+	Revision uint64 `json:"revision"`
+	// NowPlayingRevision is the FieldNowPlaying generation that last wrote
+	// NowPlaying. Revision alone cannot answer "did now-playing actually
+	// change?", because an unrelated field's merge advances it too; a source
+	// selection waiting for authoritative confirmation needs exactly that
+	// distinction.
+	NowPlayingRevision uint64 `json:"nowPlayingRevision"`
 }
 
 // Connectivity is the player's aggregate view of HTTP and event-stream
@@ -138,10 +163,44 @@ const (
 	offlineGracePeriod      = 60 * time.Second
 )
 
+// staleSourcesFailureThreshold is how many /sources reads must fail in a row
+// before the player stops offering the inventory. One failed read is not
+// evidence the list is wrong, and marking it stale immediately would disable
+// every source button on a single transient hiccup. Mirrors
+// offlineFailureThreshold's reasoning for connectivity.
+const staleSourcesFailureThreshold = 2
+
 // SpeakerConnectionState is the network state reported by the speaker.
 type SpeakerConnectionState struct {
 	State  string `json:"state"`
 	Signal string `json:"signal,omitempty"`
+}
+
+// statusEpochClock hands out strictly increasing epochs, seeded from the wall
+// clock so they keep increasing across a service restart too. A plain counter
+// would restart at 0 on restart and a plain timestamp could collide for two
+// connections created in the same millisecond; both would leave a browser
+// unable to tell a newer connection's revision sequence from an older one.
+var statusEpochClock atomic.Int64
+
+func nextStatusEpoch() int64 {
+	// Milliseconds, not nanoseconds: this value is compared in the browser,
+	// where a nanosecond timestamp exceeds Number.MAX_SAFE_INTEGER and would
+	// lose precision as a JSON number.
+	now := time.Now().UnixMilli()
+
+	for {
+		previous := statusEpochClock.Load()
+
+		next := now
+		if next <= previous {
+			next = previous + 1
+		}
+
+		if statusEpochClock.CompareAndSwap(previous, next) {
+			return next
+		}
+	}
 }
 
 // StatusField identifies one independently-racing field of DeviceStatus for
@@ -174,11 +233,13 @@ func NewDeviceConnection(c *client.Client, info *models.DeviceInfo) *DeviceConne
 		DeviceInfo: info,
 		LastSeen:   time.Now(),
 		done:       make(chan struct{}),
+		epoch:      nextStatusEpoch(),
 	}
 	conn.status.Store(&DeviceStatus{
 		Connectivity: ConnectivityOffline,
 		IsConnected:  false,
 		LastActivity: time.Now(),
+		Epoch:        conn.epoch,
 	})
 
 	if info != nil {
@@ -334,8 +395,41 @@ func (c *DeviceConnection) FinishWebSocketLoop() {
 // SetStatus atomically replaces the entire status. Use sparingly —
 // UpdateStatus is the preferred entry point because it preserves
 // concurrent changes from other goroutines.
+//
+// Revision is derived from the currently stored status rather than trusted
+// from the caller: a replacement that reset it to the caller's zero value
+// would make every browser holding a higher revision reject this device's
+// subsequent updates outright. Replacing the whole status also supersedes
+// every field, so each StatusField generation is advanced past any poll
+// still in flight.
 func (c *DeviceConnection) SetStatus(s *DeviceStatus) {
-	c.status.Store(s)
+	nowPlayingGeneration := c.supersedeAllFields()
+
+	for {
+		old := c.status.Load()
+		next := *s
+		next.Epoch = c.epoch
+		next.Revision = old.Revision + 1
+		next.NowPlayingRevision = nowPlayingGeneration
+
+		if c.status.CompareAndSwap(old, &next) {
+			return
+		}
+	}
+}
+
+// supersedeAllFields advances every StatusField generation past whatever is
+// currently in flight and returns FieldNowPlaying's new generation.
+func (c *DeviceConnection) supersedeAllFields() uint64 {
+	c.fieldGenMu.Lock()
+	defer c.fieldGenMu.Unlock()
+
+	for field := range c.fieldGen {
+		c.fieldGen[field].issued++
+		c.fieldGen[field].applied = c.fieldGen[field].issued
+	}
+
+	return c.fieldGen[FieldNowPlaying].applied
 }
 
 // BeginFieldPoll reserves a generation for an asynchronous fetch of field,
@@ -367,7 +461,10 @@ func (c *DeviceConnection) CompleteFieldPoll(field StatusField, generation uint6
 	c.fieldGen[field].applied = generation
 	c.fieldGenMu.Unlock()
 
-	c.UpdateStatus(mut)
+	c.UpdateStatus(func(status *DeviceStatus) {
+		mut(status)
+		recordFieldRevision(status, field, generation)
+	})
 
 	return true
 }
@@ -378,10 +475,65 @@ func (c *DeviceConnection) CompleteFieldPoll(field StatusField, generation uint6
 func (c *DeviceConnection) ApplyFieldEvent(field StatusField, mut func(*DeviceStatus)) {
 	c.fieldGenMu.Lock()
 	c.fieldGen[field].issued++
-	c.fieldGen[field].applied = c.fieldGen[field].issued
+	generation := c.fieldGen[field].issued
+	c.fieldGen[field].applied = generation
 	c.fieldGenMu.Unlock()
 
-	c.UpdateStatus(mut)
+	c.UpdateStatus(func(status *DeviceStatus) {
+		mut(status)
+		recordFieldRevision(status, field, generation)
+	})
+}
+
+// recordFieldRevision publishes the generation that just wrote field, for the
+// fields whose ordering a client needs to observe. Only FieldNowPlaying is
+// published today: a source selection confirms itself by waiting for a
+// now-playing write strictly newer than the one it started from, and the
+// aggregate Revision cannot express that, because any other field's merge
+// advances it too.
+func recordFieldRevision(status *DeviceStatus, field StatusField, generation uint64) {
+	if field == FieldNowPlaying {
+		status.NowPlayingRevision = generation
+	}
+}
+
+// ApplySourcesRead records the outcome of one /sources read.
+//
+// A successful read is merged under the field's generation ordering, so an
+// older in-flight read cannot overwrite a newer one, and it always clears the
+// stale marker: having just received an inventory from the speaker is the
+// strongest evidence available that the list can be acted on.
+//
+// A failure is deliberately NOT fenced by generation. It carries no inventory
+// to order, and gating it on the generation would let a single failed read
+// discard a concurrent successful one, disabling every source button until the
+// next fully successful poll. Instead failures are counted, and only
+// staleSourcesFailureThreshold of them in a row marks the inventory unusable.
+func (c *DeviceConnection) ApplySourcesRead(generation uint64, sources *models.Sources, err error) bool {
+	c.sourcesFailuresMu.Lock()
+
+	if err == nil {
+		c.consecutiveSourcesFailures = 0
+	} else {
+		c.consecutiveSourcesFailures++
+	}
+
+	stale := c.consecutiveSourcesFailures >= staleSourcesFailureThreshold
+	c.sourcesFailuresMu.Unlock()
+
+	if err != nil {
+		c.UpdateStatus(func(status *DeviceStatus) {
+			status.SourcesStale = stale
+		})
+
+		return false
+	}
+
+	return c.CompleteFieldPoll(FieldSources, generation, func(status *DeviceStatus) {
+		status.Sources = sources
+		status.SourcesStale = stale
+		status.LastActivity = time.Now()
+	})
 }
 
 // UpdateStatus atomically applies mut to a copy of the current status
@@ -397,11 +549,15 @@ func (c *DeviceConnection) ApplyFieldEvent(field StatusField, mut func(*DeviceSt
 // reader still holding the previous snapshot). Production callers
 // receive these values fresh from the device API, so this is the
 // natural shape.
+//
+// Every successful store advances Revision exactly once.
 func (c *DeviceConnection) UpdateStatus(mut func(*DeviceStatus)) {
 	for {
 		old := c.status.Load()
 		next := *old
 		mut(&next)
+		next.Epoch = c.epoch
+		next.Revision = old.Revision + 1
 
 		if c.status.CompareAndSwap(old, &next) {
 			return
@@ -733,6 +889,12 @@ type VolumeRequest struct {
 // BassRequest represents a bass control request
 type BassRequest struct {
 	Level int `json:"level"`
+}
+
+// SourceRequest represents an exact source selection request.
+type SourceRequest struct {
+	Source  string `json:"source"`
+	Account string `json:"account"`
 }
 
 // WebSocketMessage represents messages sent over WebSocket

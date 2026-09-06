@@ -797,12 +797,13 @@ func (app *WebApp) updateDeviceStatus(_ string, conn *webtypes.DeviceConnection,
 
 	if sourcesErr == nil {
 		anyFetchSucceeded = true
-
-		conn.CompleteFieldPoll(webtypes.FieldSources, sourcesGen, func(s *webtypes.DeviceStatus) {
-			s.Sources = sources
-			s.LastActivity = time.Now()
-		})
 	}
+
+	// Unlike the other fields, a FAILED /sources read is recorded too: the
+	// inventory drives which source buttons the player offers, and acting on
+	// a list the speaker no longer confirms is worse than offering none. See
+	// ApplySourcesRead for why a failure is counted rather than fenced.
+	conn.ApplySourcesRead(sourcesGen, sources, sourcesErr)
 
 	if bassErr == nil {
 		anyFetchSucceeded = true

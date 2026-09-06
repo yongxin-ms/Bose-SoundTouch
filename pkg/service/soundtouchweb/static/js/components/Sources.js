@@ -1,4 +1,5 @@
 import { h } from 'preact';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import htm from 'htm';
 import { api } from '../api.js';
 
@@ -11,16 +12,388 @@ const SOURCE_ICONS = {
     AIRPLAY: '📡', PRODUCT: '🔊',
 };
 
-export function Sources({ deviceId, status }) {
+const SOURCE_READBACK_DELAYS_MS = [2000, 5000, 10000];
+
+// Sources the speaker advertises as READY but which are NOT selectable inputs.
+// They are providers: playing one needs a station ContentItem carrying a
+// Location (see stations.ResolveContentItem, which sets type="stationurl").
+//
+// A bare /select with just source and account parks the speaker on a stub
+// now-playing -- source="RADIO_BROWSER", empty type and location, itemName
+// echoing the source name, no playStatus -- while the previous audio keeps
+// playing. The speaker then reports that stub indefinitely, so the player
+// shows a source the speaker is not actually playing.
+//
+// Verified against real hardware: RADIO_BROWSER and LOCAL_INTERNET_RADIO both
+// produce the byte-identical stub, and resuming TUNEIN from its Recents plays
+// the station as intended.
+//
+// ALEXA is advertised READY as well but is deliberately NOT listed. It cannot
+// be tested on the hardware available, so listing it would mean guessing at
+// its behaviour, and guessing wrong would break a source that works today.
+// The stub check in isStubNowPlaying covers it instead: if a bare select does
+// strand it, that is reported as a failure rather than confirmed.
+//
+// `page` is the browser to open for the source: the page in this app that
+// produces content for it. `resume` says whether clicking may first replay
+// that source's newest Recents entry.
+//
+// LOCAL_INTERNET_RADIO does not resume. AfterTouch plays its own one-shot
+// audio through that source -- TTS and the notification ding go out over
+// /custom/v1/playback/ -- so its Recents mix notifications with stations, and
+// the newest entry is as likely to be a ding as anything worth replaying.
+// Observed on real hardware: the only LOCAL_INTERNET_RADIO recent was
+// "AfterTouch ding", so resuming it played the notification. Opening Play URL,
+// which is what HandlePlayURL emits content for, is predictable instead of
+// guessing. RADIO_BROWSER and TUNEIN have no such problem: nothing writes
+// one-shot audio to them, and their Recents hold real stations.
+//
+// STORED_MUSIC does not resume either, for a different reason: it is not one
+// source but one entry per media server (its sourceAccount is a server UDN),
+// and selecting it identifies no track or container to play. Browsing is the
+// only meaningful action, so a click opens the Library. The clicked server is
+// not carried over -- the Library lists the servers itself, the same way the
+// other browser pages let you pick a device.
+const PROVIDER_SOURCES = {
+    RADIO_BROWSER: { page: 'radiobrowser', resume: true },
+    TUNEIN: { page: 'tunein', resume: true },
+    LOCAL_INTERNET_RADIO: { page: 'playurl', resume: false },
+    STORED_MUSIC: { page: 'library', resume: false },
+};
+
+function isErrorSource(source) {
+    return source === 'INVALID_SOURCE' || source?.endsWith('_ERROR');
+}
+
+// A speaker given a select it cannot act on parks on a stub now-playing
+// rather than refusing: the source name echoed back as the item name, no
+// location, and no play status, while whatever was already playing carries
+// on. Confirmed on real hardware for RADIO_BROWSER and LOCAL_INTERNET_RADIO.
+//
+// PROVIDER_SOURCES prevents the selects we know produce this. This check is
+// the backstop for the ones we do not know about, ALEXA among them: reporting
+// such a readback as success is worse than reporting nothing, because the
+// source list then shows a source the speaker is demonstrably not playing.
+//
+// All three conditions are required. A genuinely playing source reports a
+// play status even when it has no location to report, a physical input for
+// instance, so no single condition would be safe on its own.
+function isStubNowPlaying(nowPlaying) {
+    const item = nowPlaying?.ContentItem;
+    if (!item) return false;
+
+    return !item.Location && !nowPlaying.PlayStatus && item.ItemName === nowPlaying.Source;
+}
+
+function sourceAccountIdentity(source, account) {
+    return account && account !== source ? account : '';
+}
+
+function sourceAccountsMatch(source, left, right) {
+    return sourceAccountIdentity(source, left) === sourceAccountIdentity(source, right);
+}
+
+export function Sources({
+    deviceId,
+    status,
+    onStatusReadback,
+    onNavigate,
+    readbackDelays = SOURCE_READBACK_DELAYS_MS,
+}) {
+    const [command, setCommand] = useState(null);
+    const commandRef = useRef({ generation: 0, active: null, timers: [] });
+    const mountedRef = useRef(false);
     const items = status?.sources?.SourceItem ?? [];
     const currentSource = status?.nowPlaying?.Source;
     const currentAccount = status?.nowPlaying?.SourceAccount;
+    const nowPlayingRevision = Number.isSafeInteger(status?.nowPlayingRevision)
+        ? status.nowPlayingRevision : null;
+    const sourcesStale = status?.sourcesStale === true;
+
+    function clearReadbacks() {
+        commandRef.current.timers.forEach(clearTimeout);
+        commandRef.current.timers = [];
+    }
+
+    useEffect(() => {
+        if (!mountedRef.current) {
+            mountedRef.current = true;
+            return;
+        }
+
+        commandRef.current.generation += 1;
+        commandRef.current.active = null;
+        clearReadbacks();
+        setCommand(null);
+    }, [deviceId]);
+
+    useEffect(() => {
+        return () => {
+            commandRef.current.generation += 1;
+            commandRef.current.active = null;
+            clearReadbacks();
+        };
+    }, []);
+
+    useEffect(() => {
+        if (!command || nowPlayingRevision === null || command.startNowPlayingRevision === null ||
+            nowPlayingRevision <= command.startNowPlayingRevision ||
+            command.outcome === 'failed' || command.outcome === 'unverified') return;
+
+        const matches = currentSource === command.source &&
+            sourceAccountsMatch(command.source, currentAccount, command.account);
+        const stub = currentSource === command.source && isStubNowPlaying(status?.nowPlaying);
+        if (command.outcome === 'final-confirmed') {
+            if (nowPlayingRevision > command.confirmedRevision && !matches) {
+                setCommand(previous => previous?.generation === command.generation
+                    ? null : previous);
+            }
+            return;
+        }
+        if (isErrorSource(currentSource) || stub) {
+            clearReadbacks();
+            commandRef.current.active = null;
+            setCommand(previous => previous?.generation === command.generation
+                ? {
+                    ...previous,
+                    outcome: 'failed',
+                    error: stub ? 'speaker reported nothing playing' : currentSource,
+                }
+                : previous);
+        } else if (matches && command.outcome === 'pending') {
+            setCommand(previous => previous?.generation === command.generation
+                ? {
+                    ...previous,
+                    outcome: 'provisional-confirmed',
+                    confirmedRevision: nowPlayingRevision,
+                }
+                : previous);
+        }
+    }, [command, currentSource, currentAccount, nowPlayingRevision]);
 
     const ready = items.filter(s => s.Status === 'READY');
-    if (ready.length === 0) return null;
+    // Nothing to show and nothing to say: a device that has not been polled
+    // yet has no inventory to call out of date. Only render once there is
+    // either a list to offer or a list we are refusing to act on.
+    if (ready.length === 0 && !sourcesStale) return null;
 
-    function select(src) {
-        api.selectSource(deviceId, src.Source, src.SourceAccount ?? '');
+    const availabilityMessage = sourcesStale
+        ? 'Source list out of date'
+        : '';
+    const availabilityId = sourcesStale ? 'source-stale-status' : null;
+
+    // Finds the most recent playable item for a source: the newest Recents
+    // entry for it that carries a Location. Recents entries hold the real
+    // ContentItem the speaker was given, which is exactly what a provider
+    // source needs and what a bare select cannot supply.
+    async function mostRecentPlayableFor(src) {
+        const response = await api.recents(deviceId);
+        const account = src.SourceAccount ?? '';
+        const match = (response?.data?.Items ?? []).find(item => {
+            const ci = item?.ContentItem;
+            return ci?.Source === src.Source && ci?.Location &&
+                sourceAccountsMatch(src.Source, ci.SourceAccount ?? '', account);
+        });
+
+        return match?.ContentItem ?? null;
+    }
+
+    async function select(src) {
+        const provider = PROVIDER_SOURCES[src.Source];
+        if (!provider) {
+            await runSourceCommand(src,
+                () => api.selectSource(deviceId, src.Source, src.SourceAccount ?? ''));
+
+            return;
+        }
+
+        let item = null;
+        if (provider.resume) {
+            try {
+                item = await mostRecentPlayableFor(src);
+            } catch (_) {
+                item = null;
+            }
+        }
+
+        // Nothing to resume, and a bare select would strand the speaker on a
+        // stub: send the user to the browser to pick something instead.
+        if (!item) {
+            onNavigate?.(provider.page);
+
+            return;
+        }
+
+        await runSourceCommand(src, () => api.playChecked(deviceId, {
+            source: item.Source,
+            type: item.Type,
+            location: item.Location,
+            sourceAccount: item.SourceAccount,
+            itemName: item.ItemName,
+            containerArt: item.ContainerArt,
+            isPresetable: item.IsPresetable,
+        }));
+    }
+
+    async function runSourceCommand(src, write) {
+        clearReadbacks();
+        const generation = commandRef.current.generation + 1;
+        const target = { source: src.Source, account: src.SourceAccount ?? '' };
+        commandRef.current.generation = generation;
+        const active = { generation, latestReadback: -1, writeError: null };
+        commandRef.current.active = active;
+        setCommand({
+            ...target,
+            generation,
+            outcome: 'pending',
+            startNowPlayingRevision: nowPlayingRevision,
+        });
+        const startedAt = Date.now();
+
+        // Called when the readback window closes without this round matching.
+        // "Unverified" is only honest for a command nothing ever confirmed: a
+        // nowPlayingUpdated event may already have confirmed it at t=1s, and a
+        // failed readback at t=10s must not retract that. Such a command is
+        // settled as confirmed instead, since no further readback will run.
+        function settleUnverified(previous) {
+            if (previous?.generation !== generation) return previous;
+            if (previous.outcome === 'provisional-confirmed' ||
+                previous.outcome === 'final-confirmed') {
+                return { ...previous, outcome: 'final-confirmed' };
+            }
+            if (previous.outcome === 'failed') return previous;
+
+            return {
+                ...target,
+                generation,
+                outcome: 'unverified',
+                error: active.writeError?.message,
+                startNowPlayingRevision: nowPlayingRevision,
+            };
+        }
+
+        readbackDelays.forEach((delay, index) => {
+            const timer = setTimeout(async () => {
+                if (commandRef.current.active !== active) return;
+                active.latestReadback = index;
+
+                try {
+                    const response = await api.deviceNowPlaying(deviceId);
+                    if (commandRef.current.active !== active || active.latestReadback !== index) return;
+
+                    const readbackStatus = response?.data?.status;
+                    const nowPlaying = readbackStatus?.nowPlaying;
+                    const readbackRevision = readbackStatus?.nowPlayingRevision;
+                    const revisionIsNewer = nowPlayingRevision !== null &&
+                        Number.isSafeInteger(readbackRevision) &&
+                        readbackRevision > nowPlayingRevision;
+                    onStatusReadback?.(readbackStatus);
+                    if (revisionIsNewer && isErrorSource(nowPlaying?.Source)) {
+                        clearReadbacks();
+                        commandRef.current.active = null;
+                        setCommand({
+                            ...target,
+                            generation,
+                            outcome: 'failed',
+                            error: nowPlaying.Source,
+                            startNowPlayingRevision: nowPlayingRevision,
+                        });
+                    } else if (revisionIsNewer && nowPlaying?.Source === target.source &&
+                        isStubNowPlaying(nowPlaying)) {
+                        clearReadbacks();
+                        commandRef.current.active = null;
+                        setCommand({
+                            ...target,
+                            generation,
+                            outcome: 'failed',
+                            error: 'speaker reported nothing playing',
+                            startNowPlayingRevision: nowPlayingRevision,
+                        });
+                    } else if (revisionIsNewer && nowPlaying?.Source === target.source &&
+                        sourceAccountsMatch(target.source, nowPlaying?.SourceAccount, target.account)) {
+                        // A match is not the end of the story: /select answers
+                        // 200 even for a source the speaker goes on to reject a
+                        // few seconds later, which surfaces as a transition to
+                        // an error source. Something has to keep watching.
+                        //
+                        // The event stream is the better watcher when it is
+                        // live: nowPlayingUpdated reports that transition as it
+                        // happens, and the effect above already turns it into a
+                        // failure. Polling on top of that only re-asks a
+                        // question we are already subscribed to the answer of.
+                        // So keep the remaining readbacks only as a fallback
+                        // for a device whose events we are not receiving.
+                        const isFinalReadback = index === readbackDelays.length - 1;
+                        const eventStreamWatching = readbackStatus?.webSocketConnected === true;
+                        const settled = isFinalReadback || eventStreamWatching;
+                        setCommand({
+                            ...target,
+                            generation,
+                            outcome: settled ? 'final-confirmed' : 'provisional-confirmed',
+                            startNowPlayingRevision: nowPlayingRevision,
+                            confirmedRevision: readbackRevision,
+                        });
+                        if (settled) {
+                            clearReadbacks();
+                            commandRef.current.active = null;
+                        }
+                    } else if (index === readbackDelays.length - 1) {
+                        commandRef.current.active = null;
+                        setCommand(settleUnverified);
+                    }
+                } catch (_) {
+                    if (commandRef.current.active === active && active.latestReadback === index &&
+                        index === readbackDelays.length - 1) {
+                        commandRef.current.active = null;
+                        setCommand(settleUnverified);
+                    }
+                }
+            }, Math.max(0, delay - (Date.now() - startedAt)));
+            commandRef.current.timers.push(timer);
+        });
+
+        try {
+            await write();
+        } catch (error) {
+            if (commandRef.current.active !== active) return;
+            // A definitive refusal (4xx) means the speaker never saw the
+            // command, so there is nothing for the readbacks to confirm and
+            // reporting it now beats waiting out the readback window. Anything
+            // else stays pending: a 5xx or a transport error does not tell us
+            // whether the speaker acted, so we keep verifying and carry the
+            // reason into whatever outcome the readbacks reach.
+            if (!error?.definitive) {
+                active.writeError = error;
+
+                return;
+            }
+            clearReadbacks();
+            commandRef.current.active = null;
+            setCommand(previous => previous?.generation === generation
+                ? { ...previous, outcome: 'failed', error: error?.message }
+                : previous);
+        }
+    }
+
+    const projectsTarget = command && (command.outcome === 'pending' ||
+        command.outcome === 'provisional-confirmed' || command.outcome === 'final-confirmed');
+    const projectedSource = projectsTarget
+        ? command.source : currentSource;
+    const projectedAccount = projectsTarget
+        ? command.account : (currentAccount ?? '');
+
+    const outcomeText = {
+        pending: 'Selecting source',
+        'provisional-confirmed': 'Source selected, confirming',
+        'final-confirmed': 'Source selected',
+        unverified: 'Source selection unverified',
+        failed: 'Source selection failed',
+    };
+
+    function commandMessage(cmd) {
+        if (!cmd) return '';
+        const text = outcomeText[cmd.outcome];
+        return cmd.error ? `${text}: ${cmd.error}` : text;
     }
 
     return html`
@@ -28,20 +401,34 @@ export function Sources({ deviceId, status }) {
             <h3 class="section-title">Sources</h3>
             <div class="source-list">
                 ${ready.map(src => {
-                    const isActive = src.Source === currentSource &&
-                        (!src.SourceAccount || src.SourceAccount === currentAccount);
+                    const account = src.SourceAccount ?? '';
+                    const isTarget = command?.source === src.Source && command?.account === account;
+                    const isActive = src.Source === projectedSource &&
+                        sourceAccountsMatch(src.Source, account, projectedAccount);
+                    const outcome = isTarget ? command.outcome : '';
                     return html`
                         <button
-                            key=${src.Source + (src.SourceAccount || '')}
-                            class="source-btn ${isActive ? 'active' : ''} ${src.IsLocal ? 'local' : ''}"
+                            key=${src.Source + account}
+                            class="source-btn ${isActive ? 'active' : ''} ${src.IsLocal ? 'local' : ''} ${outcome}"
                             onClick=${() => select(src)}
-                            title=${src.Source}
+                            disabled=${sourcesStale}
+                            title=${availabilityMessage || (outcome ? commandMessage(command) : src.Source)}
+                            aria-describedby=${availabilityId}
+                            aria-busy=${outcome === 'pending' || outcome === 'provisional-confirmed' ? 'true' : null}
                         >
                             <span class="source-icon">${SOURCE_ICONS[src.Source] || '🔊'}</span>
                             <span class="source-name">${src.DisplayName || src.Source}</span>
                         </button>
                     `;
                 })}
+            </div>
+            <div
+                id=${availabilityId}
+                class="source-command-status ${availabilityMessage ? 'availability' : ''}"
+                role="status"
+                aria-live="polite"
+            >
+                ${availabilityMessage || commandMessage(command)}
             </div>
         </div>
     `;

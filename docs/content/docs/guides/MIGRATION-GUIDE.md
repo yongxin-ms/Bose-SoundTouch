@@ -174,6 +174,20 @@ Once the speaker appears, click **Sync Data**. This connects to the speaker and 
 
 Sync pulls the speaker's local state into AfterTouch's datastore, creating an off-device backup of its configuration. If you ran this before May 6, 2026, your account data from Bose's servers was also captured at that time.
 
+Migration is refused until the service has a valid snapshot for that exact
+account and device and verifies that its rendered account data preserves every
+live preset slot. If the migration page asks for Data Sync, sync the device and
+retry instead of bypassing the check.
+
+If the account already contains other devices, migration proceeds but the log
+says so. Some speaker firmware has been reported to wipe its presets after a
+reboot-triggered resync of a shared account even when `/full` contains the
+correct data (see issue #614, where the root cause is still open). One account
+holding every speaker in the household is the normal arrangement, so this is a
+warning rather than a refusal; if you do hit the preset wipe, moving that
+speaker to a dedicated account and running Data Sync for it is the known
+workaround.
+
 ---
 
 ## Step 5: Migrate
@@ -331,7 +345,7 @@ The wizard is still the recommended path for a one-off migration of an existing 
 If you need to undo a migration:
 
 - **From the web UI**: Use the **Revert to Defaults** action on the device — this restores the `.original` backup files created on the speaker during the XML migration.
-- **Telnet-only migrations**: the wizard writes both the runtime configuration layer (`sys configuration …`) and the persistent layer (`envswitch boseurls set …`) so the migration survives reboot. If you want to revert quickly, the cleanest path is to re-run the wizard with the original Bose URLs in the URL editor.
+- **Telnet-only migrations**: the wizard writes both the runtime configuration layer (`sys configuration …`) and the persistent layer (`envswitch boseurls set …`) so the migration survives reboot. Use **Restore Bose URLs via Telnet** in the web UI or run `soundtouch-cli --host <device> setup revert --method telnet`. This restores only the four canonical Bose URL fields; use the CLI URL override flags if your original firmware- or region-specific values differ. The web action is offered whenever the live telnet configuration contains a non-canonical URL, including a URL for an older AfterTouch backend.
 - **Via SSH**: The original XML config is backed up on the speaker with a `.original` suffix. Restore it manually if the UI is unreachable.
 - **Factory reset**: As a last resort, perform a factory reset (see [Device Initial Setup](DEVICE-INITIAL-SETUP.md) for button sequences). This wipes all configuration and returns the speaker to out-of-box state.
 

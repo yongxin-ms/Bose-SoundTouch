@@ -21,7 +21,84 @@ import { removeDeviceAndRefresh } from './deviceRemoval.js';
 
 const html = htm.bind(h);
 
-function DeviceDetail({ deviceId, devices, onBack, onDevicesChanged, notify, onRemove }) {
+// Reconnect backoff for the status socket, doubling from base to max.
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 15000;
+
+function statusRevision(status) {
+    const revision = status?.revision;
+    return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
+}
+
+function statusEpoch(status) {
+    const epoch = status?.epoch;
+    return Number.isSafeInteger(epoch) ? epoch : null;
+}
+
+// The server advances DeviceStatus.revision on every projection, so a frame
+// carrying a revision no newer than what we already hold is stale -- a slow
+// `devices` snapshot overtaken by a `status_update` delta, or a REST refresh
+// overtaken by either. A device we have never seen is always accepted.
+//
+// Revisions are only comparable within one epoch. A device id backed by a new
+// DeviceConnection, or a restarted service, restarts its revisions at 0, and
+// without the epoch check the browser would reject every later frame for that
+// id and display a status frozen at whatever it last held.
+function acceptsNewerStatus(current, incoming) {
+    const currentEpoch = statusEpoch(current);
+    const incomingEpoch = statusEpoch(incoming);
+    if (currentEpoch !== null && incomingEpoch !== null && incomingEpoch !== currentEpoch) {
+        return incomingEpoch > currentEpoch;
+    }
+
+    const currentRevision = statusRevision(current);
+    const incomingRevision = statusRevision(incoming);
+    if (currentRevision === null) return true;
+    return incomingRevision !== null && incomingRevision > currentRevision;
+}
+
+export function mergeDevicesSnapshot(previous, snapshot) {
+    return Object.fromEntries(Object.entries(snapshot || {}).map(([deviceId, incoming]) => {
+        const current = Object.prototype.hasOwnProperty.call(previous, deviceId)
+            ? previous[deviceId] : null;
+        if (!current || acceptsNewerStatus(current.status, incoming?.status)) {
+            return [deviceId, incoming];
+        }
+        // Keep the whole entry we already hold, not just its status. The
+        // server derives stereoPair from the very status.Group this snapshot
+        // lost the comparison on, so taking the incoming projection alongside
+        // the newer status would describe a pair the newer status already
+        // dissolved. The next snapshot carries a status we accept together
+        // with a matching projection, and one is due within 5s (sooner in
+        // practice: whatever produced the newer status also queued a
+        // device-list broadcast).
+        return [deviceId, current];
+    }));
+}
+
+function replaceDevice(previous, deviceId, device) {
+    return Object.fromEntries([
+        ...Object.entries(previous),
+        [deviceId, device],
+    ]);
+}
+
+export function mergeStatusUpdate(previous, deviceId, status) {
+    // Object.prototype.hasOwnProperty, not a plain previous[deviceId] truthy
+    // check: a deviceId of "__proto__" or "constructor" would otherwise
+    // resolve through the prototype chain to a truthy value and pass the
+    // check despite not being a real, known device.
+    if (!Object.prototype.hasOwnProperty.call(previous, deviceId) ||
+        !acceptsNewerStatus(previous[deviceId]?.status, status)) {
+        return previous;
+    }
+    return replaceDevice(previous, deviceId, {
+        ...previous[deviceId],
+        status,
+    });
+}
+
+function DeviceDetail({ deviceId, devices, onBack, onDevicesChanged, notify, onRemove, onStatusReadback, onNavigate }) {
     const device = devices[deviceId];
 
     if (!device) {
@@ -47,7 +124,12 @@ function DeviceDetail({ deviceId, devices, onBack, onDevicesChanged, notify, onR
             <${NowPlaying} nowPlaying=${device.status?.nowPlaying} deviceId=${deviceId} presets=${device.status?.presets} />
             <${Controls} deviceId=${deviceId} status=${device.status} />
             <${Presets} deviceId=${deviceId} status=${device.status} />
-            <${Sources} deviceId=${deviceId} status=${device.status} />
+            <${Sources}
+                deviceId=${deviceId}
+                status=${device.status}
+                onStatusReadback=${status => onStatusReadback(deviceId, status)}
+                onNavigate=${onNavigate}
+            />
             <${StereoPair}
                 deviceId=${deviceId}
                 device=${device}
@@ -94,6 +176,9 @@ function App() {
     const [toast, setToast] = useState(null);
     const [version, setVersion] = useState(null);
     const [isDiscovering, setIsDiscovering] = useState(false);
+    // 'connecting' until the first frame arrives, so a page opened while the
+    // service is down does not claim the connection was lost.
+    const [connection, setConnection] = useState('connecting');
 
     const getPageTitle = () => {
         if (page === 'devices') return 'Devices';
@@ -130,13 +215,15 @@ function App() {
             .catch(err => console.error('Failed to fetch version:', err));
 
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${protocol}//${location.host}/api/control/ws`);
+        let socket = null;
         let reconnectTimer;
+        let backoff = RECONNECT_BASE_MS;
+        let closed = false;
 
-        ws.onmessage = (event) => {
+        const handleMessage = (event) => {
             const msg = JSON.parse(event.data);
             if (msg.type === 'devices') {
-                setDevices(msg.data || {});
+                setDevices(previous => mergeDevicesSnapshot(previous, msg.data));
             } else if (msg.type === 'discovery_status') {
                 if (msg.data?.isDiscovering !== undefined) {
                     setIsDiscovering(msg.data.isDiscovering);
@@ -150,27 +237,49 @@ function App() {
                     showToast(`Found ${msg.data.deviceCount} device(s)`);
                 }
             } else if (msg.type === 'status_update' && msg.deviceId) {
-                setDevices(prev => {
-                    // Object.prototype.hasOwnProperty, not a plain prev[msg.deviceId]
-                    // truthy check: a deviceId of "__proto__" or "constructor" would
-                    // otherwise resolve through the prototype chain to a truthy value
-                    // and pass the check despite not being a real, known device.
-                    if (!Object.prototype.hasOwnProperty.call(prev, msg.deviceId)) return prev;
-                    return {
-                        ...prev,
-                        [msg.deviceId]: { ...prev[msg.deviceId], status: msg.data },
-                    };
-                });
+                setDevices(previous => mergeStatusUpdate(previous, msg.deviceId, msg.data));
             }
         };
 
-        ws.onclose = () => {
-            reconnectTimer = setTimeout(() => location.reload(), 5000);
-        };
+        // Reconnect in place rather than reloading. Reloading a page whose
+        // own document is served by the service cannot work while the service
+        // is down: it replaces a working UI with the browser's error page and
+        // loses everything the page held. Reconnecting keeps the page usable
+        // and recovers on its own when the service returns.
+        //
+        // This is safe because each status carries the epoch of the
+        // connection that produced it. A restarted service publishes
+        // revisions from 0 again, which the browser would otherwise reject
+        // forever; a newer epoch is accepted regardless of its revision, so a
+        // reconnected socket resynchronises without a reload.
+        function connect() {
+            if (closed) return;
+
+            const ws = new WebSocket(`${protocol}//${location.host}/api/control/ws`);
+            socket = ws;
+
+            ws.onopen = () => {
+                backoff = RECONNECT_BASE_MS;
+                setConnection('online');
+            };
+
+            ws.onmessage = handleMessage;
+
+            ws.onclose = () => {
+                if (closed || socket !== ws) return;
+
+                setConnection('offline');
+                reconnectTimer = setTimeout(connect, backoff);
+                backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
+            };
+        }
+
+        connect();
 
         return () => {
+            closed = true;
             clearTimeout(reconnectTimer);
-            ws.close();
+            socket?.close();
         };
     }, []);
 
@@ -200,7 +309,13 @@ function App() {
     async function refreshDevices() {
         const resp = await api.devices();
         if (!resp?.success) throw new Error(resp?.error || 'Failed to refresh devices');
-        setDevices(resp.data || {});
+        // Ordered like the WebSocket frames: a slow REST snapshot must not
+        // clobber a newer status that arrived over the socket meanwhile.
+        setDevices(previous => mergeDevicesSnapshot(previous, resp.data));
+    }
+
+    function mergeDeviceReadback(deviceId, status) {
+        setDevices(previous => mergeStatusUpdate(previous, deviceId, status));
     }
 
     async function removeDevice(id) {
@@ -302,6 +417,8 @@ function App() {
                         onDevicesChanged=${refreshDevices}
                         notify=${showToast}
                         onRemove=${removeDevice}
+                        onStatusReadback=${mergeDeviceReadback}
+                        onNavigate=${navigate}
                     />
                 ` : page === 'tunein' ? html`
                     <${TuneInBrowser} key="tunein-browser" devices=${devices} />
@@ -328,10 +445,19 @@ function App() {
                     </footer>
                 ` : null}
 
+            ${connection !== 'online' ? html`
+                <div class="connection-banner ${connection}" role="status" aria-live="polite" key="connection">
+                    ${connection === 'connecting'
+                        ? 'Connecting to AfterTouch…'
+                        : 'Lost contact with AfterTouch. Reconnecting…'}
+                </div>
+            ` : null}
+
             ${toast ? html`<div class="toast" role="status" aria-live="polite"
                                 aria-atomic="true" key="toast">${toast}</div>` : null}
         </div>
     `;
 }
 
-render(html`<${App} />`, document.getElementById('app'));
+const appRoot = document.getElementById('app');
+if (appRoot) render(html`<${App} />`, appRoot);

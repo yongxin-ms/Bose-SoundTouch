@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gesellix/bose-soundtouch/pkg/client"
@@ -80,6 +81,12 @@ type MigrationSummary struct {
 	CurrentResolvConf        string      `json:"current_resolv_conf,omitempty"`
 	PlannedResolv            string      `json:"planned_resolv,omitempty"`
 	IsMigrated               bool        `json:"is_migrated"`
+	// Data readiness, so the pre-flight panel can show a refusal before the
+	// user commits to Apply instead of only surfacing it as a 409 afterwards.
+	// DataReadyError is the reason migration will be refused; empty means it
+	// will proceed. DataReadyWarnings are advisory and do not block.
+	DataReadyError    string   `json:"data_ready_error,omitempty"`
+	DataReadyWarnings []string `json:"data_ready_warnings,omitempty"`
 	// Per-axis migration signals — IsMigrated is the OR of these. The UI
 	// displays them individually so users can see partial states (e.g.
 	// URLs flipped via telnet but the on-disk XML hasn't caught up, or
@@ -107,10 +114,11 @@ type MigrationSummary struct {
 
 	// Telnet (port 17000) preflight state — populated when the user is about to
 	// or has just used MigrationMethodTelnet.
-	TelnetReachable      bool   `json:"telnet_reachable"`
-	TelnetBanner         string `json:"telnet_banner,omitempty"`
-	TelnetVerifiedConfig string `json:"telnet_verified_config,omitempty"`
-	TelnetProbeError     string `json:"telnet_probe_error,omitempty"`
+	TelnetReachable       bool   `json:"telnet_reachable"`
+	TelnetBanner          string `json:"telnet_banner,omitempty"`
+	TelnetVerifiedConfig  string `json:"telnet_verified_config,omitempty"`
+	TelnetProbeError      string `json:"telnet_probe_error,omitempty"`
+	TelnetRevertAvailable bool   `json:"telnet_revert_available"`
 
 	// KnownAccountIDs are accountIDs already present in the local datastore;
 	// the UI offers them as choices when pairing a fresh device.
@@ -155,6 +163,11 @@ type Manager struct {
 	NewSSH    func(host string) SSHClient
 	NewTelnet func(host string) TelnetClient
 
+	// URL-changing telnet operations are multi-command sequences. Keep each
+	// speaker's sequence contiguous while allowing different speakers to run
+	// independently.
+	telnetURLMutationLocks sync.Map // device IP -> *sync.Mutex
+
 	// NewSession opens the WebSocket setup state-machine session used
 	// by ExecuteInitPlan. Tests inject an in-memory fake; the production
 	// default is DialSession.
@@ -169,6 +182,19 @@ type Manager struct {
 	// Spotify management credentials for the boot primer
 	MgmtUsername string
 	MgmtPassword string
+}
+
+func (m *Manager) lockTelnetURLMutation(deviceIP string) func() {
+	value, _ := m.telnetURLMutationLocks.LoadOrStore(deviceIP, &sync.Mutex{})
+
+	mu, ok := value.(*sync.Mutex)
+	if !ok {
+		panic("setup: telnet URL mutation lock has unexpected type")
+	}
+
+	mu.Lock()
+
+	return mu.Unlock
 }
 
 // NewManager creates a new Manager with the given base server URL.
@@ -301,6 +327,13 @@ func (m *Manager) GetMigrationSummary(deviceIP, targetURL, proxyURL string, opti
 
 	summary := &MigrationSummary{
 		SSHSuccess: false,
+	}
+
+	// Same read-only check MigrateSpeaker runs, reported rather than enforced.
+	if warnings, err := m.checkMigrationDataReady(deviceIP); err != nil {
+		summary.DataReadyError = err.Error()
+	} else {
+		summary.DataReadyWarnings = warnings
 	}
 
 	// Run the telnet preflight in parallel with the SSH-based probes below.
@@ -526,6 +559,7 @@ func (m *Manager) buildServerHTTPSURL(targetURL string) string {
 // up in `getpdo CurrentSystemConfiguration`.
 func (m *Manager) checkIsMigrated(summary *MigrationSummary, deviceIP string) {
 	summary.TelnetMigrated = m.isTelnetMigrated(summary)
+	summary.TelnetRevertAvailable = telnetRevertAvailable(summary.TelnetVerifiedConfig)
 
 	if summary.SSHSuccess {
 		client := m.NewSSH(deviceIP)
@@ -873,6 +907,18 @@ func (m *Manager) firstCACertBodyLine() (string, bool) {
 
 // MigrateSpeaker configures the speaker at the given IP to use this service.
 func (m *Manager) MigrateSpeaker(deviceIP, targetURL, proxyURL string, options map[string]string, method MigrationMethod) (string, error) {
+	readinessWarnings, err := m.checkMigrationDataReady(deviceIP)
+	if err != nil {
+		return "", err
+	}
+
+	// Surfaced in the migration log the UI shows, alongside the other
+	// "Warning:" lines, so an advisory reaches the user without blocking them.
+	var preflightLogs string
+	for _, warning := range readinessWarnings {
+		preflightLogs += fmt.Sprintf("Warning: %s\n", warning)
+	}
+
 	if targetURL == "" {
 		targetURL = m.ServerURL
 	}
@@ -886,10 +932,12 @@ func (m *Manager) MigrateSpeaker(deviceIP, targetURL, proxyURL string, options m
 	// rooted via remote_services.
 	if method == MigrationMethodTelnet {
 		urls := telnetURLsFromOptions(targetURL, options)
-		return m.migrateViaTelnet(deviceIP, targetURL, urls)
+		telnetLogs, telnetErr := m.migrateViaTelnet(deviceIP, urls)
+
+		return preflightLogs + telnetLogs, telnetErr
 	}
 
-	var logs string
+	logs := preflightLogs
 
 	// 0. Off-device backup for safety
 	if backupErr := m.BackupConfigOffDevice(deviceIP); backupErr != nil {
@@ -1130,6 +1178,14 @@ func (m *Manager) resyncBoseURLsAfterXML(deviceIP string, urls telnetURLs) strin
 
 	rlogs, rerr := m.setAllBoseURLsViaTelnet(deviceIP, urls)
 	if rerr != nil {
+		// A rejected URL is not the device being unreachable, and saying so
+		// would send the user looking at telnet. The XML write has already
+		// happened with this value, so the URL itself is what needs attention.
+		if errors.Is(rerr, ErrInvalidTelnetURL) {
+			return fmt.Sprintf("Note: skipped the telnet boseurls re-sync because a URL was rejected (%v); "+
+				"the XML configuration was still written, and a device reboot will reconcile the runtime layer.\n", rerr)
+		}
+
 		return fmt.Sprintf("Note: could not re-sync boseurls over telnet (%v); a device reboot will reconcile the runtime layer.\n", rerr)
 	}
 
@@ -2254,6 +2310,10 @@ func (m *Manager) rebootViaTelnet(deviceIP string) (string, error) {
 		return "", errors.New("telnet reboot not configured: Manager.NewTelnet is nil")
 	}
 
+	// Do not let a reboot cut through a multi-command URL mutation.
+	unlock := m.lockTelnetURLMutation(deviceIP)
+	defer unlock()
+
 	fmt.Printf("Rebooting speaker at %s via telnet\n", deviceIP)
 
 	t := m.NewTelnet(deviceIP)
@@ -2867,6 +2927,10 @@ func (m *Manager) fetchLivePresets(deviceIP string) ([]models.ServicePreset, err
 	}
 
 	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("GET %s returned %d", presetsURL, resp.StatusCode)
+	}
 
 	var ps models.Presets
 	if decodeErr := xml.NewDecoder(resp.Body).Decode(&ps); decodeErr != nil {

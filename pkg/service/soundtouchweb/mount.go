@@ -69,9 +69,15 @@ func (app *WebApp) MountWeb(r chi.Router, discoveryService *discovery.UnifiedDis
 				r.Post("/power", app.HandleDevicePower)
 				r.Get("/power-status", app.HandleDevicePowerStatus)
 				r.Get("/recents", app.HandleDeviceRecents)
+				// Now-playing-only refresh. The player's source-selection
+				// readback uses this instead of the full device fetch, which
+				// would poll every field to answer one question.
+				r.Get("/now-playing", app.HandleDeviceNowPlaying)
 				// Low-level "play this ContentItem" primitive (not a provider).
 				r.Post("/play", app.HandleDevicePlay)
-				// Generic key / preset / source / bass actions.
+				// Generic key / preset / source / bass actions. Source selection is
+				// canonically POSTed as JSON; its GET form remains temporarily for
+				// compatibility and marks every response as deprecated.
 				r.Get("/action/{action}", app.HandleAPIControl)
 				r.Post("/action/{action}", app.HandleAPIControl)
 				r.Get("/ws", app.HandleDeviceWebSocket)
