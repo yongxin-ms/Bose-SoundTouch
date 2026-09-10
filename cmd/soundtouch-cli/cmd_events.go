@@ -209,7 +209,8 @@ func parseEventFilters(eventFilter string) map[string]bool {
 	validFilters := map[string]bool{
 		"nowPlaying": true, "volume": true, "connection": true,
 		"preset": true, "zone": true, "group": true, "bass": true,
-		"sdkInfo": true, "userActivity": true,
+		"sdkInfo": true, "userActivity": true, "userInactivity": true,
+		"errors": true, "balance": true,
 	}
 
 	if eventFilter == "" {
@@ -308,6 +309,13 @@ func setupEventHandlers(wsClient *client.WebSocketClient, filters map[string]boo
 		})
 	}
 
+	// Stereo-pair balance events
+	if filters == nil || filters["balance"] {
+		wsClient.OnBalanceUpdated(func(event *models.BalanceUpdatedEvent) {
+			handleBalanceEvent(event, verbose)
+		})
+	}
+
 	// Special message handler
 	wsClient.OnSpecialMessage(func(message *models.SpecialMessage) {
 		handleSpecialMessage(message, filters, verbose)
@@ -385,22 +393,26 @@ func handleVolumeEvent(event *models.VolumeUpdatedEvent, verbose bool) {
 }
 
 func handleConnectionEvent(event *models.ConnectionStateUpdatedEvent) {
-	cs := &event.ConnectionState
 	fmt.Printf("\n🌐 Connection Update [%s]:\n", event.DeviceID)
 
-	if cs.IsConnected() {
-		fmt.Println("  ✅ Connected")
+	if event.IsConnected() {
+		fmt.Printf("  ✅ Connected (%s)\n", event.State)
 	} else {
-		fmt.Printf("  ❌ State: %s\n", cs.State)
+		fmt.Printf("  ❌ State: %s\n", event.State)
 	}
 
-	if cs.Signal != "" {
-		fmt.Printf("  📶 Signal: %s\n", cs.GetSignalStrength())
+	if event.Signal != "" {
+		fmt.Printf("  📶 Signal: %s\n", event.GetSignalStrength())
 	}
 }
 
 func handlePresetEvent(event *models.PresetUpdatedEvent, verbose bool) {
-	presets := &event.Presets
+	if !event.HasPayload() {
+		fmt.Printf("\n⭐ Presets Updated (no list sent; re-read /presets)\n")
+		return
+	}
+
+	presets := event.Presets
 
 	deviceHeader := "\n📻 Presets Update"
 	if event.DeviceID != "" {
@@ -473,7 +485,12 @@ func handleGroupEvent(event *models.GroupUpdatedEvent) {
 }
 
 func handleBassEvent(event *models.BassUpdatedEvent) {
-	bass := &event.Bass
+	if !event.HasPayload() {
+		fmt.Printf("\n🎵 Bass Updated (no value sent; re-read /bass)\n")
+		return
+	}
+
+	bass := event.Bass
 	fmt.Printf("\n🎵 Bass Update [%s]:\n", event.DeviceID)
 	fmt.Printf("  🎚️  Level: %d\n", bass.ActualBass)
 
@@ -507,6 +524,10 @@ func handleSpecialMessage(message *models.SpecialMessage, filters map[string]boo
 			if !filters["userInactivity"] {
 				return
 			}
+		case models.MessageTypeErrorUpdate:
+			if !filters["errors"] {
+				return
+			}
 		}
 	}
 
@@ -529,6 +550,8 @@ func handleSpecialMessage(message *models.SpecialMessage, filters map[string]boo
 		if verbose {
 			fmt.Printf("  ⏰ Timestamp: %s\n", message.Timestamp.Format("15:04:05"))
 		}
+	case models.MessageTypeErrorUpdate:
+		handleDeviceError(message, verbose)
 	default:
 		fmt.Printf("\n❓ Unknown Special Message: %s\n", message.String())
 
@@ -538,17 +561,67 @@ func handleSpecialMessage(message *models.SpecialMessage, filters map[string]boo
 	}
 }
 
-func handleUnknownEvent(event *models.WebSocketEvent, verbose bool) {
-	fmt.Printf("\n❓ Unknown Event [%s]:\n", event.DeviceID)
-	types := event.GetEventTypes()
+// handleDeviceError prints a root-level <errorUpdate> frame. These name the
+// failure precisely — numeric code, symbolic name, severity — and are the
+// most useful thing the speaker says when playback goes wrong.
+func handleDeviceError(message *models.SpecialMessage, verbose bool) {
+	errorUpdate := message.GetErrorUpdate()
+	if errorUpdate == nil {
+		return
+	}
 
-	for _, eventType := range types {
-		fmt.Printf("  📝 Type: %s\n", eventType)
+	devErr := &errorUpdate.Error
+
+	fmt.Printf("\n🚨 Device Error [%s]:\n", message.DeviceID)
+	fmt.Printf("  🔢 Code: %s\n", devErr.Value)
+	fmt.Printf("  🏷️  Name: %s\n", devErr.Name)
+
+	if devErr.Severity != "" {
+		fmt.Printf("  ⚠️  Severity: %s\n", devErr.Severity)
+	}
+
+	if text := strings.TrimSpace(devErr.Text); text != "" {
+		fmt.Printf("  💬 Detail: %s\n", text)
 	}
 
 	if verbose {
-		events := event.GetEvents()
-		fmt.Printf("  📱 Event count: %d\n", len(events))
+		fmt.Printf("  ⏰ Timestamp: %s\n", message.Timestamp.Format("15:04:05"))
+	}
+}
+
+// handleBalanceEvent prints a stereo-pair balance notification.
+//
+// The frame is empty — <balanceUpdated></balanceUpdated>, no attributes, no
+// payload — so there is no value to show. It means "re-read /balance", and
+// saying that is more useful than printing nothing.
+func handleBalanceEvent(_ *models.BalanceUpdatedEvent, verbose bool) {
+	fmt.Println("\n🔊 Balance Updated (stereo pair)")
+	fmt.Println("  ↩️  Carries no value; re-read /balance for the new setting")
+
+	if verbose {
+		fmt.Printf("  ⏰ Timestamp: %s\n", time.Now().Format("15:04:05"))
+	}
+}
+
+func handleUnknownEvent(event *models.WebSocketEvent, verbose bool) {
+	fmt.Printf("\n❓ Unknown Event [%s]:\n", event.DeviceID)
+
+	for _, eventType := range event.GetEventTypes() {
+		fmt.Printf("  📝 Type: %s\n", eventType)
+	}
+
+	// The interesting case is an <updates> child we don't model at all
+	// (nowSelectionUpdated, say): GetEventTypes is empty for it, and printing
+	// only that says "something arrived, and I won't tell you what".
+	// UnknownEventNames exists precisely to name it — but registering an
+	// OnUnknownEvent handler opts out of the client's own fallback log, which
+	// is the only other place it gets used.
+	for _, name := range event.UnknownEventNames() {
+		fmt.Printf("  📛 Unmodelled element: %s\n", name)
+	}
+
+	if verbose {
+		fmt.Printf("  📱 Event count: %d\n", len(event.GetEvents()))
 		fmt.Printf("  ⏰ Timestamp: %s\n", event.Timestamp.Format(time.RFC3339))
 	}
 }

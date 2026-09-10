@@ -644,6 +644,8 @@ func (app *WebApp) handleControlAction(w http.ResponseWriter, r *http.Request, a
 		app.handleStorePreset(w, r, device)
 	case "bass":
 		app.handleBassControl(w, r, device)
+	case "balance":
+		app.handleBalanceControl(w, r, device)
 	case "source":
 		app.handleSourceControl(w, r, device)
 	default:
@@ -749,6 +751,90 @@ func (app *WebApp) handleBassControl(w http.ResponseWriter, r *http.Request, dev
 
 	err := device.Client.SetBass(bassReq.Level)
 	app.sendControlResponse(w, err, fmt.Sprintf("Bass set to %d", bassReq.Level))
+}
+
+// balanceControlTimeout caps a balance read-then-write over the WebSocket.
+// Generous because it covers two round trips, but bounded: /balance is the one
+// endpoint known to block rather than refuse when a speaker is asleep.
+const balanceControlTimeout = 12 * time.Second
+
+// handleBalanceControl processes stereo-pair balance requests.
+//
+// Two things make this unlike the other audio controls:
+//
+//   - The write goes over the WEBSOCKET. POST /balance hangs rather than
+//     refusing, and the app Bose ships on the speaker writes balance only over
+//     the socket (GH-699).
+//   - The valid range comes from the DEVICE (a SoundTouch 10 pair reports
+//     -7..7), so the bound check uses the reading that precedes the write
+//     instead of a constant.
+//
+// Either member of the pair accepts it. A speaker that is not paired reports
+// the balance unavailable, which comes back as a 409 rather than a failure.
+func (app *WebApp) handleBalanceControl(w http.ResponseWriter, r *http.Request, device *webtypes.DeviceConnection) {
+	if r.Method != http.MethodPost {
+		app.sendError(w, "POST required for balance control", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var balanceReq webtypes.BalanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&balanceReq); err != nil {
+		app.sendError(w, "Invalid balance data", http.StatusBadRequest)
+		return
+	}
+
+	wsClient := device.CurrentWebSocket()
+	if wsClient == nil {
+		app.sendError(w, "Balance needs a live WebSocket to the speaker, and none is connected", http.StatusServiceUnavailable)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), balanceControlTimeout)
+	defer cancel()
+
+	// Validate against the reading we already hold rather than fetching one
+	// per write. The bounds are what validation needs, they do not change
+	// while a pair exists, and the status copy is kept current by the
+	// connect-time watch, by balanceUpdated and by groupUpdated.
+	//
+	// Reading first made every balance write two round trips where volume and
+	// bass are one, and put the extra hit on /balance — the one endpoint that
+	// blocks rather than refusing when a speaker is asleep. A stale cache
+	// costs nothing here: the speaker rejects a write it cannot honour, and
+	// that error is surfaced.
+	current := device.Status().Balance
+
+	if current == nil || !current.Available {
+		fetched, err := wsClient.GetBalance(ctx)
+		if err != nil {
+			app.sendControlResponse(w, err, "")
+			return
+		}
+
+		current = fetched
+	}
+
+	if !current.Available {
+		app.sendError(w, "This speaker has no balance; it is not part of a stereo pair", http.StatusConflict)
+		return
+	}
+
+	if validateErr := current.Validate(balanceReq.Level); validateErr != nil {
+		app.sendError(w, validateErr.Error(), http.StatusBadRequest)
+		return
+	}
+
+	updated, err := wsClient.SetBalanceWithBounds(ctx, balanceReq.Level, current)
+	if err != nil {
+		app.sendControlResponse(w, err, "")
+		return
+	}
+
+	// The write echoes the whole balance document, so the status can be
+	// refreshed from it directly. Re-reading over HTTP would risk the stale
+	// value that endpoint briefly reports after a write.
+	app.applyBalanceEvent(device, updated)
+	app.sendControlResponse(w, nil, fmt.Sprintf("Balance set to %d", updated.Target))
 }
 
 // handleSourceControl processes source control requests. POST with an exact
@@ -1652,6 +1738,7 @@ func (app *WebApp) HandlePlayURL(w http.ResponseWriter, r *http.Request) {
 		Type:         "stationurl",
 		Location:     location,
 		ItemName:     req.Name,
+		ContainerArt: req.ImageURL,
 		IsPresetable: true,
 	}
 
@@ -1737,6 +1824,10 @@ func (app *WebApp) HandlePlayRadioBrowser(w http.ResponseWriter, r *http.Request
 	var req struct {
 		Location string `json:"location"`
 		Name     string `json:"name"`
+		// The speaker stores whatever art it is given at select time, and
+		// presets/recents read it back from there. Dropping it here is why
+		// saved radio stations used to show a placeholder.
+		ContainerArt string `json:"containerArt"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1750,9 +1841,10 @@ func (app *WebApp) HandlePlayRadioBrowser(w http.ResponseWriter, r *http.Request
 	}
 
 	ci := stations.ResolveContentItem(stations.PlayItem{
-		Provider: stations.ProviderRadioBrowser,
-		Location: req.Location,
-		Name:     req.Name,
+		Provider:     stations.ProviderRadioBrowser,
+		Location:     req.Location,
+		Name:         req.Name,
+		ContainerArt: req.ContainerArt,
 	})
 
 	logPlaybackRequest("radiobrowser", deviceID, ci.Source, ci.SourceAccount, ci.Location, ci.ItemName)

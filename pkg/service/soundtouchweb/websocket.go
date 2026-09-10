@@ -307,6 +307,186 @@ func (app *WebApp) applyBassEvent(
 	})
 }
 
+// balanceWatchSchedule is the wait before each retry after a connection comes
+// up. It starts short because the common case resolves almost immediately —
+// the /getGroup poll only needs a moment — and a flat interval left a visible
+// gap where the pair was on screen but the slider was not. It then stretches
+// out, so a speaker that genuinely has no balance stops being asked.
+var balanceWatchSchedule = []time.Duration{
+	2 * time.Second,
+	3 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	15 * time.Second,
+	30 * time.Second,
+}
+
+// watchBalance establishes the balance reading for a device, retrying briefly
+// until the speaker answers.
+//
+// It reads over HTTP, deliberately. Reads do not need the WebSocket — only
+// writes do — and that socket is created lazily, on the first control request
+// that needs one. Hanging the read off it meant a paired speaker showed no
+// slider until something was pressed: the pair was on screen, the speaker
+// answered balanceAvailable=true to anyone who asked, and nobody asked.
+//
+// Retrying rather than reading once covers the other case: a pair that already
+// existed at startup is discovered by the /getGroup poll running concurrently,
+// and groupUpdated only fires when the pairing CHANGES.
+//
+// The loop stops as soon as a balance is known or the device goes away, so a
+// speaker that genuinely has none costs a handful of cheap requests and then
+// nothing. GetBalance carries its own short timeout, so a sleeping speaker
+// cannot stall this either.
+func (app *WebApp) watchBalance(deviceID string, conn *webtypes.DeviceConnection) {
+	for attempt, wait := range balanceWatchSchedule {
+		app.refreshBalance(deviceID, conn)
+
+		if conn.Status().Balance != nil {
+			if attempt > 0 {
+				log.Printf("Speaker %s: balance became readable on attempt %d",
+					sanitizeLog(deviceID), attempt+1)
+			}
+
+			return
+		}
+
+		select {
+		case <-time.After(wait):
+		case <-conn.Done():
+			return
+		}
+	}
+
+	// One last attempt after the final wait, so the longest interval is not
+	// spent only to give up without using it.
+	app.refreshBalance(deviceID, conn)
+}
+
+// refreshBalance reads the balance and stores it on the device status.
+//
+// The only gate is the model: balance exists on SoundTouch 10s, and asking
+// anything else is pointless. Whether it currently APPLIES is the speaker's
+// call, reported as balanceAvailable, and that is the single authority here —
+// an unavailable answer clears the reading so the UI drops the control.
+//
+// It deliberately does NOT pre-check status.Group. That looks like a free
+// optimisation and is actually a race: on startup this runs alongside the
+// first /getGroup poll, so the group is usually still nil, and gating on it
+// meant the reading was skipped exactly when it was first needed.
+func (app *WebApp) refreshBalance(deviceID string, conn *webtypes.DeviceConnection) {
+	if conn.Client == nil || !stereoPairCapable(conn.DeviceInfo) {
+		return
+	}
+
+	// Coalesce. Dragging the slider emits a burst of balanceUpdated frames —
+	// four inside one second, measured — and reading once per frame would
+	// pile concurrent requests onto an endpoint that blocks on a sleeping
+	// speaker. Whoever is already reading will read once more on our behalf,
+	// so the final value still lands.
+	if !conn.BeginBalanceRefresh() {
+		return
+	}
+
+	for {
+		app.readBalanceOnce(deviceID, conn)
+
+		if !conn.EndBalanceRefresh() {
+			return
+		}
+	}
+}
+
+// readBalanceOnce performs a single balance read and stores the result.
+func (app *WebApp) readBalanceOnce(deviceID string, conn *webtypes.DeviceConnection) {
+	balance, err := conn.Client.GetBalance()
+	if err != nil {
+		log.Printf("Speaker %s: balance read failed: %v", sanitizeLog(deviceID), sanitizeLog(err.Error()))
+
+		return
+	}
+
+	if !balance.Available {
+		// Log the whole answer, not just the fact of it: the range and target
+		// reported alongside are the evidence for why it is unavailable.
+		log.Printf("Speaker %s: balance reported unavailable (range %d..%d, default %d, target %d, actual %d)",
+			sanitizeLog(deviceID), balance.Min, balance.Max, balance.Default, balance.Target, balance.Actual)
+
+		app.clearBalance(conn)
+
+		return
+	}
+
+	app.applyBalanceEvent(conn, balance)
+}
+
+// clearBalance drops any stored reading, which is how the UI learns the
+// control no longer applies — the pair was torn down.
+func (app *WebApp) clearBalance(conn *webtypes.DeviceConnection) {
+	if conn.Status().Balance == nil {
+		return
+	}
+
+	app.applyBalanceEvent(conn, nil)
+}
+
+// isStandbySource reports whether a now-playing source means the speaker is
+// idle. An empty source counts: it is what we hold before the first reading.
+func isStandbySource(source string) bool {
+	switch strings.ToUpper(strings.TrimSpace(source)) {
+	case "", "STANDBY", "INVALID_SOURCE":
+		return true
+	default:
+		return false
+	}
+}
+
+// refreshBass re-reads /bass after a payload-free bassUpdated signal.
+func (app *WebApp) refreshBass(deviceID string, conn *webtypes.DeviceConnection) {
+	if conn.Client == nil {
+		return
+	}
+
+	bass, err := conn.Client.GetBass()
+	if err != nil {
+		log.Printf("Speaker %s: bass re-read failed: %v", sanitizeLog(deviceID), sanitizeLog(err.Error()))
+
+		return
+	}
+
+	app.applyBassEvent(conn, bass)
+}
+
+// refreshPresets re-reads /presets after a payload-free presetsUpdated signal.
+func (app *WebApp) refreshPresets(deviceID string, conn *webtypes.DeviceConnection) {
+	if conn.Client == nil {
+		return
+	}
+
+	presets, err := conn.Client.GetPresets()
+	if err != nil {
+		log.Printf("Speaker %s: presets re-read failed: %v", sanitizeLog(deviceID), sanitizeLog(err.Error()))
+
+		return
+	}
+
+	app.applyPresetEvent(conn, presets)
+}
+
+// applyBalanceEvent stores a fresh balance reading on the device status.
+func (app *WebApp) applyBalanceEvent(
+	conn *webtypes.DeviceConnection,
+	balance *models.Balance,
+) {
+	app.applySpeakerStatusEvent(conn, webtypes.FieldBalance, func(status *webtypes.DeviceStatus) bool {
+		changed := !reflect.DeepEqual(status.Balance, balance)
+		status.Balance = balance
+		status.LastActivity = time.Now()
+
+		return changed
+	})
+}
+
 // registerDeviceWebSocketClient gives conn its own write-serialization lock,
 // mirroring registerGlobalWebSocket's role for the browser-wide pool. Unlike
 // registerGlobalWebSocket, there are no initial frames to send under it --
@@ -487,6 +667,10 @@ func (app *WebApp) HandleAPIDiscover(w http.ResponseWriter, r *http.Request) {
 // device. Initial connection failures are retried here; after the first
 // success WebSocketClient owns transport reconnects and this supervisor
 // observes their state until the device is removed.
+//
+// It deliberately takes no context: it outlives any request, and the
+// connection's own lifetime (conn.Done) is the scope that matters. Work it
+// starts derives its context from that rather than inheriting a caller's.
 func (app *WebApp) ConnectDeviceWebSocket(deviceID string, conn *webtypes.DeviceConnection) {
 	// Skip WebSocket connection if client is not available (e.g., in tests)
 	if conn.Client == nil {
@@ -533,6 +717,14 @@ func (app *WebApp) ConnectDeviceWebSocket(deviceID string, conn *webtypes.Device
 				logNowPlayingError(deviceID, np.Source, np.SourceAccount)
 			}
 
+			// Waking up can flip whether the speaker answers for balance at
+			// all, and a reading taken while it was asleep would have been
+			// stored as "no balance here". Re-read on the transition out of
+			// standby, once, rather than on every event.
+			if np.Source != prevSource && isStandbySource(prevSource) && !isStandbySource(np.Source) {
+				go app.refreshBalance(deviceID, conn)
+			}
+
 			prevSource = np.Source
 
 			app.applyNowPlayingEvent(conn, np)
@@ -554,29 +746,74 @@ func (app *WebApp) ConnectDeviceWebSocket(deviceID string, conn *webtypes.Device
 				return
 			}
 
-			app.applyConnectionStateEvent(conn, event.ConnectionState.IsConnected())
+			app.applyConnectionStateEvent(conn, event.IsConnected())
 			conn.ApplySpeakerConnectionEvent(webtypes.SpeakerConnectionState{
-				State:  event.ConnectionState.State,
-				Signal: event.ConnectionState.Signal,
+				State:  event.State,
+				Up:     event.Up,
+				Signal: event.Signal,
 			}, time.Now())
+		})
+
+		// Device errors are the speaker's own diagnosis of a failure —
+		// code, symbolic name, severity. Logging them costs nothing and is
+		// exactly the evidence issue reports keep lacking (GH-701).
+		wsClient.OnDeviceError(func(event *models.ErrorUpdate) {
+			log.Printf("Speaker %s reported error %s (%s) severity=%s: %s",
+				sanitizeLog(deviceID),
+				sanitizeLog(event.Error.Name),
+				sanitizeLog(event.Error.Value),
+				sanitizeLog(event.Error.Severity),
+				sanitizeLog(strings.TrimSpace(event.Error.Text)),
+			)
+		})
+
+		// balanceUpdated carries no payload — it is a signal to re-read, not
+		// a value.
+		wsClient.OnBalanceUpdated(func(_ *models.BalanceUpdatedEvent) {
+			go app.refreshBalance(deviceID, conn)
 		})
 
 		wsClient.OnPresetUpdated(func(event *models.PresetUpdatedEvent) {
 			activity := time.Now()
 
-			app.applyPresetEvent(conn, &event.Presets)
 			conn.MarkEventStreamActivity(activity)
+
+			// The speaker sends this element both with the full list and as a
+			// bare signal. Applying the empty case as data would blank a
+			// perfectly good preset list, so re-read instead.
+			if !event.HasPayload() {
+				go app.refreshPresets(deviceID, conn)
+
+				return
+			}
+
+			app.applyPresetEvent(conn, event.Presets)
 		})
 
 		wsClient.OnBassUpdated(func(event *models.BassUpdatedEvent) {
 			activity := time.Now()
 
-			app.applyBassEvent(conn, &event.Bass)
 			conn.MarkEventStreamActivity(activity)
+
+			// Every captured bassUpdated frame is empty; it is a re-read
+			// signal, not a value. Taking the zero value out of one and
+			// storing it is what made the Player's bass slider snap to 0 on
+			// every change.
+			if !event.HasPayload() {
+				go app.refreshBass(deviceID, conn)
+
+				return
+			}
+
+			app.applyBassEvent(conn, event.Bass)
 		})
 
 		wsClient.OnGroupUpdated(func(event *models.GroupUpdatedEvent) {
 			app.applyGroupUpdatedEvent(conn, event)
+
+			// Creating or tearing down a pair flips whether balance exists
+			// here at all, so the reading has to follow the group.
+			go app.refreshBalance(deviceID, conn)
 		})
 
 		wsClient.OnNameUpdated(func(event *models.NameUpdatedEvent) {

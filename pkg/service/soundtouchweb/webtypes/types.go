@@ -72,9 +72,16 @@ type DeviceConnection struct {
 	speakerEventGen     uint64
 	pollEventGen        map[uint64]uint64
 
-	lastTransportGeneration    uint64
-	eventStreamConnected       bool
-	lastDirectSuccess          time.Time
+	lastTransportGeneration uint64
+	eventStreamConnected    bool
+	lastDirectSuccess       time.Time
+	// balanceRefresh coalesces concurrent balance reads: 0 idle, 1 running,
+	// 2 running with another read already requested. A slider drag emits a
+	// burst of balanceUpdated frames — four in the same second, measured —
+	// and each one used to start its own HTTP read of an endpoint that
+	// blocks on a sleeping speaker.
+	balanceRefresh atomic.Int32
+
 	speakerConnectionKnown     bool
 	speakerConnectionConnected bool
 	speakerConnectionObserved  time.Time
@@ -121,6 +128,7 @@ type DeviceStatus struct {
 	Sources                *models.Sources         `json:"sources,omitempty"`
 	SourcesStale           bool                    `json:"sourcesStale,omitempty"`
 	Bass                   *models.Bass            `json:"bass,omitempty"`
+	Balance                *models.Balance         `json:"balance,omitempty"`
 	Group                  *models.Group           `json:"group,omitempty"`
 	Connectivity           Connectivity            `json:"connectivity"`
 	HTTPReachable          bool                    `json:"httpReachable"`
@@ -171,8 +179,14 @@ const (
 const staleSourcesFailureThreshold = 2
 
 // SpeakerConnectionState is the network state reported by the speaker.
+//
+// Up is the speaker's own boolean for "the link is up". State is the
+// transport-qualified name it ships alongside ("NETWORK_WIFI_CONNECTED"), kept
+// for display only — it is not a value worth matching on, see
+// ApplySpeakerConnectionEvent.
 type SpeakerConnectionState struct {
 	State  string `json:"state"`
+	Up     bool   `json:"up"`
 	Signal string `json:"signal,omitempty"`
 }
 
@@ -220,6 +234,7 @@ const (
 	FieldPresets
 	FieldSources
 	FieldBass
+	FieldBalance
 	FieldConnectivity
 	numStatusFields
 )
@@ -542,7 +557,8 @@ func (c *DeviceConnection) ApplySourcesRead(generation uint64, sources *models.S
 // writers cannot silently lose each other's changes.
 //
 // The copy mut receives is a shallow value copy of the previous status.
-// Nested pointer fields (NowPlaying, Volume, Presets, Sources, Bass, Group)
+// Nested pointer fields (NowPlaying, Volume, Presets, Sources, Bass, Balance,
+// Group)
 // share their backing struct with the previous version: callers MUST
 // REPLACE these pointers (s.Volume = &models.Volume{...}) rather than
 // mutate through them (s.Volume.ActualVolume++ would race with any
@@ -606,11 +622,21 @@ func (c *DeviceConnection) ApplySpeakerConnectionEvent(state SpeakerConnectionSt
 	c.markEventStreamActivityLocked(at)
 	c.speakerConnectionObserved = at
 
-	switch strings.ToUpper(strings.TrimSpace(state.State)) {
-	case string(models.ConnectionStateConnected):
+	// Up is the only positive evidence accepted, matching
+	// models.ConnectionStateUpdatedEvent.IsConnected — the two must agree,
+	// because websocket.go feeds the same event to both.
+	//
+	// Matching on State used to be the only test here, and it fell to the
+	// default branch for every real frame: speakers report
+	// "NETWORK_WIFI_CONNECTED", never a bare "CONNECTED" (GH-701). State is
+	// now consulted only to tell a confirmed disconnect apart from "we
+	// cannot tell" — deliberately with no symmetric CONNECTED case, since
+	// reaching it would mean the state string claims a link that up denies.
+	switch upper := strings.ToUpper(strings.TrimSpace(state.State)); {
+	case state.Up:
 		c.speakerConnectionKnown = true
 		c.speakerConnectionConnected = true
-	case string(models.ConnectionStateDisconnected):
+	case strings.HasSuffix(upper, string(models.ConnectionStateDisconnected)):
 		c.speakerConnectionKnown = true
 		c.speakerConnectionConnected = false
 	default:
@@ -624,6 +650,41 @@ func (c *DeviceConnection) ApplySpeakerConnectionEvent(state SpeakerConnectionSt
 		status.LastActivity = at
 		c.applyConnectivityLocked(status, at)
 	})
+}
+
+// BeginBalanceRefresh reports whether the caller should perform a balance
+// read. When one is already in flight it records that another is wanted and
+// returns false, so a burst of events collapses into at most one extra read.
+func (c *DeviceConnection) BeginBalanceRefresh() bool {
+	for {
+		switch current := c.balanceRefresh.Load(); current {
+		case 0:
+			if c.balanceRefresh.CompareAndSwap(0, 1) {
+				return true
+			}
+		default:
+			if c.balanceRefresh.CompareAndSwap(current, 2) {
+				return false
+			}
+		}
+	}
+}
+
+// EndBalanceRefresh closes a read and reports whether another was requested
+// while it ran, in which case the caller should read once more.
+func (c *DeviceConnection) EndBalanceRefresh() bool {
+	for {
+		switch current := c.balanceRefresh.Load(); current {
+		case 2:
+			if c.balanceRefresh.CompareAndSwap(2, 1) {
+				return true
+			}
+		default:
+			if c.balanceRefresh.CompareAndSwap(current, 0) {
+				return false
+			}
+		}
+	}
 }
 
 // ObserveEventStreamTransport applies an authoritative client transport
@@ -883,6 +944,15 @@ type APIResponse struct {
 
 // VolumeRequest represents a volume control request
 type VolumeRequest struct {
+	Level int `json:"level"`
+}
+
+// BalanceRequest is a stereo-pair balance control request.
+//
+// Level is validated against the range the DEVICE reports, not a constant:
+// a SoundTouch 10 pair reports -7..7, and the widely-copied ±50 assumption is
+// wrong (GH-699).
+type BalanceRequest struct {
 	Level int `json:"level"`
 }
 

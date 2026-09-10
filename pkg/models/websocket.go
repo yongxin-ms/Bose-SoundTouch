@@ -1,6 +1,7 @@
 package models
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"strings"
@@ -33,6 +34,8 @@ const (
 	EventTypeClockDisplayUpdated WebSocketEventType = "clockDisplayUpdated"
 	// EventTypeNameUpdated indicates a device name change
 	EventTypeNameUpdated WebSocketEventType = "nameUpdated"
+	// EventTypeBalanceUpdated indicates a stereo-pair balance change
+	EventTypeBalanceUpdated WebSocketEventType = "balanceUpdated"
 	// EventTypeErrorUpdated indicates an error status change
 	EventTypeErrorUpdated WebSocketEventType = "errorUpdated"
 	// EventTypeRecentsUpdated indicates a recent items list change
@@ -64,6 +67,8 @@ func (e WebSocketEventType) String() string {
 		return "Stereo Pair Updated"
 	case EventTypeBassUpdated:
 		return "Bass Updated"
+	case EventTypeBalanceUpdated:
+		return "Balance Updated"
 	case EventTypeClockTimeUpdated:
 		return "Clock Time Updated"
 	case EventTypeClockDisplayUpdated:
@@ -96,6 +101,7 @@ type WebSocketEvent struct {
 	ZoneUpdated            *ZoneUpdatedEvent            `xml:"zoneUpdated,omitempty"`
 	GroupUpdated           *GroupUpdatedEvent           `xml:"groupUpdated,omitempty"`
 	BassUpdated            *BassUpdatedEvent            `xml:"bassUpdated,omitempty"`
+	BalanceUpdated         *BalanceUpdatedEvent         `xml:"balanceUpdated,omitempty"`
 	ClockTimeUpdated       *ClockTimeUpdatedEvent       `xml:"clockTimeUpdated,omitempty"`
 	ClockDisplayUpdated    *ClockDisplayUpdatedEvent    `xml:"clockDisplayUpdated,omitempty"`
 	NameUpdated            *NameUpdatedEvent            `xml:"nameUpdated,omitempty"`
@@ -158,6 +164,10 @@ func (e *WebSocketEvent) GetEvents() []interface{} {
 		events = append(events, e.BassUpdated)
 	}
 
+	if e.BalanceUpdated != nil {
+		events = append(events, e.BalanceUpdated)
+	}
+
 	if e.ClockTimeUpdated != nil {
 		events = append(events, e.ClockTimeUpdated)
 	}
@@ -199,45 +209,77 @@ type VolumeUpdatedEvent struct {
 	Volume   Volume   `xml:"volume"`
 }
 
-// ConnectionStateUpdatedEvent represents a connection state update event
+// ConnectionStateUpdatedEvent represents a connection state update event.
+//
+// The speaker puts everything in attributes on the element itself. Captured
+// on a SoundTouch 10 (variant=rhino, moduleType=sm2, FW 27.0.6):
+//
+//	<updates deviceID="DEVICEID01">
+//	  <connectionStateUpdated state="NETWORK_WIFI_CONNECTED" up="true"
+//	                          signal="EXCELLENT_SIGNAL" />
+//	</updates>
+//
+// There is no nested <connectionState> child. This type used to model one,
+// which is why State and Signal were always empty (GH-701). The shape is not
+// in Bose's published Web API document; it only exists in captures.
 type ConnectionStateUpdatedEvent struct {
-	XMLName         xml.Name        `xml:"connectionStateUpdated"`
-	DeviceID        string          `xml:"deviceID,attr"`
-	ConnectionState ConnectionState `xml:"connectionState"`
-}
-
-// ConnectionState represents the device's network connection state
-type ConnectionState struct {
-	XMLName xml.Name `xml:"connectionState"`
-	State   string   `xml:"state,attr"`
-	Signal  string   `xml:"signal,attr"`
+	XMLName  xml.Name `xml:"connectionStateUpdated"`
+	DeviceID string   `xml:"deviceID,attr"`
+	State    string   `xml:"state,attr"`
+	Up       bool     `xml:"up,attr"`
+	Signal   string   `xml:"signal,attr"`
 }
 
 // ConnectionStateType represents connection state values
 type ConnectionStateType string
 
 const (
-	// ConnectionStateConnected indicates the device is connected
+	// ConnectionStateConnected indicates the device is connected.
+	//
+	// Kept for compatibility: no captured frame has ever carried this bare
+	// value. Real speakers report transport-qualified states such as
+	// ConnectionStateWiFiConnected, which is why IsConnected reads the
+	// up attribute rather than comparing against these constants.
 	ConnectionStateConnected ConnectionStateType = "CONNECTED"
 	// ConnectionStateDisconnected indicates the device is disconnected
 	ConnectionStateDisconnected ConnectionStateType = "DISCONNECTED"
+	// ConnectionStateWiFiConnected is the state a Wi-Fi-attached speaker
+	// actually reports (field-observed, FW 27.0.6).
+	ConnectionStateWiFiConnected ConnectionStateType = "NETWORK_WIFI_CONNECTED"
 )
 
-// IsConnected returns true if the device is connected
-func (cs *ConnectionState) IsConnected() bool {
-	return cs.State == string(ConnectionStateConnected)
+// IsConnected reports whether the speaker considers its network link up.
+//
+// This reads the up attribute rather than matching State against
+// ConnectionStateConnected: the device sends transport-qualified state names
+// ("NETWORK_WIFI_CONNECTED"), so a string comparison would never match, while
+// up is an unambiguous boolean the firmware sets on every frame we captured.
+func (e *ConnectionStateUpdatedEvent) IsConnected() bool {
+	return e.Up
 }
 
 // GetSignalStrength returns the signal strength as a string
-func (cs *ConnectionState) GetSignalStrength() string {
-	return cs.Signal
+func (e *ConnectionStateUpdatedEvent) GetSignalStrength() string {
+	return e.Signal
 }
 
-// PresetUpdatedEvent represents a preset update event
+// PresetUpdatedEvent represents a preset update event.
+//
+// Presets is OPTIONAL. The speaker sends this element both ways: with the full
+// list, and as a bare <presetsUpdated/> carrying nothing (3 of 9 occurrences
+// across the reference captures). A nil Presets means "re-read /presets", NOT
+// "the speaker has no presets" — treating the empty case as data blanks a
+// perfectly good preset list.
 type PresetUpdatedEvent struct {
 	XMLName  xml.Name `xml:"presetsUpdated"`
 	DeviceID string   `xml:"deviceID,attr"`
-	Presets  Presets  `xml:"presets"`
+	Presets  *Presets `xml:"presets"`
+}
+
+// HasPayload reports whether this frame carried a preset list rather than
+// being a bare re-read signal.
+func (e *PresetUpdatedEvent) HasPayload() bool {
+	return e != nil && e.Presets != nil
 }
 
 // ZoneUpdatedEvent represents a multiroom zone update event
@@ -271,11 +313,44 @@ type ZoneMember struct {
 	IP       string   `xml:"ipaddress,attr"`
 }
 
-// BassUpdatedEvent represents a bass setting update event
+// BassUpdatedEvent represents a bass setting update event.
+//
+// Bass is OPTIONAL, and in practice absent: every bassUpdated frame in the
+// reference captures is empty — <bassUpdated></bassUpdated>, 4 of 4 — and the
+// live traces agree. It is a "re-read /bass" signal, the same shape as
+// balanceUpdated.
+//
+// A nil Bass therefore means "no value was sent". Reading a value out of an
+// empty frame yields a fabricated level 0, which then overwrites the real
+// setting; the Player's bass slider snapping to 0 on every change was exactly
+// that.
 type BassUpdatedEvent struct {
 	XMLName  xml.Name `xml:"bassUpdated"`
 	DeviceID string   `xml:"deviceID,attr"`
-	Bass     Bass     `xml:"bass"`
+	Bass     *Bass    `xml:"bass"`
+}
+
+// HasPayload reports whether this frame carried a bass value rather than being
+// a bare re-read signal.
+func (e *BassUpdatedEvent) HasPayload() bool {
+	return e != nil && e.Bass != nil
+}
+
+// BalanceUpdatedEvent signals that the stereo pair's balance changed.
+//
+// It carries NO payload and NO attributes — the captured frame is exactly
+//
+//	<updates deviceID="DEVICEID01"><balanceUpdated></balanceUpdated></updates>
+//
+// so it is a "re-read /balance" trigger, not a value. Confirmed on hardware
+// after both an HTTP and a WebSocket write (FW 27.0.6).
+//
+// There is deliberately no DeviceID field: the device ID lives on the parent
+// <updates> element (WebSocketEvent.DeviceID), and a deviceID attribute here
+// would be permanently empty — the same shape of bug as the unpopulated
+// ConnectionState this package used to carry (GH-701).
+type BalanceUpdatedEvent struct {
+	XMLName xml.Name `xml:"balanceUpdated"`
 }
 
 // ClockTimeUpdatedEvent represents a clock time update event
@@ -299,19 +374,30 @@ type NameUpdatedEvent struct {
 	Name     Name     `xml:"name"`
 }
 
-// ErrorUpdatedEvent represents an error state update event
+// ErrorUpdatedEvent represents an <errorUpdated> child of <updates>.
+//
+// No capture has ever contained this element. Real speakers report errors as
+// a root-level <errorUpdate> frame (present tense, outside <updates>) — see
+// ErrorUpdate, which is the shape that actually arrives on the wire. This type
+// is retained because the past-tense name appears in third-party API notes and
+// costs nothing to keep parsing.
 type ErrorUpdatedEvent struct {
 	XMLName  xml.Name `xml:"errorUpdated"`
 	DeviceID string   `xml:"deviceID,attr"`
 	Error    Error    `xml:"error"`
 }
 
-// Error represents an error state
+// Error represents an error state.
+//
+// Value is the numeric code, Name its symbolic form (e.g.
+// "STORED_MUSIC_AP_TIMEOUT"), Severity one of "Unrecoverable" / "Unknown" as
+// observed on FW 27.0.6, and Text the device's human-readable detail.
 type Error struct {
-	XMLName xml.Name `xml:"error"`
-	Value   string   `xml:"value,attr"`
-	Name    string   `xml:"name,attr"`
-	Text    string   `xml:",chardata"`
+	XMLName  xml.Name `xml:"error"`
+	Value    string   `xml:"value,attr"`
+	Name     string   `xml:"name,attr"`
+	Severity string   `xml:"severity,attr"`
+	Text     string   `xml:",chardata"`
 }
 
 // RecentsUpdatedEvent represents a recent items update event
@@ -369,6 +455,7 @@ const (
 	MessageTypeSdkInfo        SpecialMessageType = "sdkInfo"
 	MessageTypeUserActivity   SpecialMessageType = "userActivity"
 	MessageTypeUserInactivity SpecialMessageType = "userInactivity"
+	MessageTypeErrorUpdate    SpecialMessageType = "errorUpdate"
 )
 
 // SoundTouchSdkInfo represents the SDK info message sent on connection
@@ -388,6 +475,27 @@ type UserActivityUpdate struct {
 type UserInactivityUpdate struct {
 	XMLName  xml.Name `xml:"userInactivityUpdate"`
 	DeviceID string   `xml:"deviceID,attr"`
+}
+
+// ErrorUpdate is a root-level device-error notification.
+//
+// Note the present tense: this is NOT ErrorUpdatedEvent, which models an
+// <errorUpdated> child of <updates> and has never been seen on the wire. The
+// speaker sends errors unwrapped, at the top level (FW 27.0.6):
+//
+//	<errorUpdate deviceID="DEVICEID01">
+//	  <error value="1654" name="STORED_MUSIC_AP_TIMEOUT"
+//	         severity="Unrecoverable">APServer: Timeout</error>
+//	</errorUpdate>
+//
+// These frames name a failure precisely — numeric code, symbolic name,
+// severity — which makes them the most useful diagnostic the speaker offers
+// when playback goes wrong. Before GH-701 they were dropped as an unknown
+// special message type.
+type ErrorUpdate struct {
+	XMLName  xml.Name `xml:"errorUpdate"`
+	DeviceID string   `xml:"deviceID,attr"`
+	Error    Error    `xml:"error"`
 }
 
 // SpecialMessage represents non-updates WebSocket messages
@@ -417,6 +525,7 @@ type WebSocketEventHandlers struct {
 	OnZoneUpdated         TypedEventHandler[*ZoneUpdatedEvent]
 	OnGroupUpdated        TypedEventHandler[*GroupUpdatedEvent]
 	OnBassUpdated         TypedEventHandler[*BassUpdatedEvent]
+	OnBalanceUpdated      TypedEventHandler[*BalanceUpdatedEvent]
 	OnClockTimeUpdated    TypedEventHandler[*ClockTimeUpdatedEvent]
 	OnClockDisplayUpdated TypedEventHandler[*ClockDisplayUpdatedEvent]
 	OnNameUpdated         TypedEventHandler[*NameUpdatedEvent]
@@ -424,7 +533,12 @@ type WebSocketEventHandlers struct {
 	OnRecentsUpdated      TypedEventHandler[*RecentsUpdatedEvent]
 	OnLanguageUpdated     TypedEventHandler[*LanguageUpdatedEvent]
 	OnUnknownEvent        EventHandler
-	OnSpecialMessage      SpecialMessageHandler
+	// OnDeviceError fires for root-level <errorUpdate> frames — the
+	// speaker's own error reports. OnSpecialMessage still fires for the
+	// same frame; this handler exists so callers that only care about
+	// device errors don't have to type-switch.
+	OnDeviceError    TypedEventHandler[*ErrorUpdate]
+	OnSpecialMessage SpecialMessageHandler
 	// OnRawMessage fires for every received frame before any parsing
 	// happens. Use it for debug/observability tooling that wants to see
 	// exactly what the device sent on the wire — the typed handlers
@@ -437,6 +551,100 @@ type WebSocketEventHandlers struct {
 
 // RawMessageHandler defines the signature for raw-frame handlers.
 type RawMessageHandler func(data []byte, parseErr error)
+
+// UnmarshalXML decodes an <updates> frame and copies its deviceID down to the
+// child events.
+//
+// The device ID appears ONLY on <updates>: across the reference captures, 226
+// child elements carry no deviceID attribute and none carries one. Each child
+// event type declares the field anyway, so without this every DeviceID handed
+// to a typed handler is the empty string — which is what printed the bare "[]"
+// in the CLI's event output.
+//
+// Typed handlers receive only the child, so the parent's value is the only
+// place the device identity can come from.
+func (e *WebSocketEvent) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	// A distinct type avoids recursing back into this method.
+	type rawEvent WebSocketEvent
+
+	var raw rawEvent
+	if err := d.DecodeElement(&raw, &start); err != nil {
+		return err
+	}
+
+	*e = WebSocketEvent(raw)
+	e.propagateDeviceID()
+
+	return nil
+}
+
+// propagateDeviceID fills in each present child's DeviceID from the parent,
+// leaving alone any that somehow arrived with one of its own.
+func (e *WebSocketEvent) propagateDeviceID() {
+	if e.DeviceID == "" {
+		return
+	}
+
+	targets := []*string{}
+
+	if e.NowPlayingUpdated != nil {
+		targets = append(targets, &e.NowPlayingUpdated.DeviceID)
+	}
+
+	if e.VolumeUpdated != nil {
+		targets = append(targets, &e.VolumeUpdated.DeviceID)
+	}
+
+	if e.ConnectionStateUpdated != nil {
+		targets = append(targets, &e.ConnectionStateUpdated.DeviceID)
+	}
+
+	if e.PresetUpdated != nil {
+		targets = append(targets, &e.PresetUpdated.DeviceID)
+	}
+
+	if e.ZoneUpdated != nil {
+		targets = append(targets, &e.ZoneUpdated.DeviceID)
+	}
+
+	if e.GroupUpdated != nil {
+		targets = append(targets, &e.GroupUpdated.DeviceID)
+	}
+
+	if e.BassUpdated != nil {
+		targets = append(targets, &e.BassUpdated.DeviceID)
+	}
+
+	if e.ClockTimeUpdated != nil {
+		targets = append(targets, &e.ClockTimeUpdated.DeviceID)
+	}
+
+	if e.ClockDisplayUpdated != nil {
+		targets = append(targets, &e.ClockDisplayUpdated.DeviceID)
+	}
+
+	if e.NameUpdated != nil {
+		targets = append(targets, &e.NameUpdated.DeviceID)
+	}
+
+	if e.ErrorUpdated != nil {
+		targets = append(targets, &e.ErrorUpdated.DeviceID)
+	}
+
+	if e.RecentsUpdated != nil {
+		targets = append(targets, &e.RecentsUpdated.DeviceID)
+	}
+
+	if e.LanguageUpdated != nil {
+		targets = append(targets, &e.LanguageUpdated.DeviceID)
+	}
+
+	for _, target := range targets {
+		if *target == "" {
+			*target = e.DeviceID
+		}
+	}
+}
 
 // ParseWebSocketEvent attempts to parse a WebSocket message into a specific event type
 func ParseWebSocketEvent(data []byte) (*WebSocketEvent, error) {
@@ -469,6 +677,8 @@ func (e *WebSocketEvent) getFieldByEventType(eventType WebSocketEventType) inter
 		field = e.GroupUpdated
 	case EventTypeBassUpdated:
 		field = e.BassUpdated
+	case EventTypeBalanceUpdated:
+		field = e.BalanceUpdated
 	case EventTypeClockTimeUpdated:
 		field = e.ClockTimeUpdated
 	case EventTypeClockDisplayUpdated:
@@ -522,6 +732,8 @@ func isNil(i interface{}) bool {
 		return v == nil
 	case *BassUpdatedEvent:
 		return v == nil
+	case *BalanceUpdatedEvent:
+		return v == nil
 	case *ClockTimeUpdatedEvent:
 		return v == nil
 	case *ClockDisplayUpdatedEvent:
@@ -570,6 +782,8 @@ func (e *WebSocketEvent) HasEventType(eventType WebSocketEventType) bool {
 		return e.GroupUpdated != nil
 	case EventTypeBassUpdated:
 		return e.BassUpdated != nil
+	case EventTypeBalanceUpdated:
+		return e.BalanceUpdated != nil
 	case EventTypeClockTimeUpdated:
 		return e.ClockTimeUpdated != nil
 	case EventTypeClockDisplayUpdated:
@@ -619,6 +833,10 @@ func (e *WebSocketEvent) GetEventTypes() []WebSocketEventType {
 		types = append(types, EventTypeBassUpdated)
 	}
 
+	if e.BalanceUpdated != nil {
+		types = append(types, EventTypeBalanceUpdated)
+	}
+
 	if e.ClockTimeUpdated != nil {
 		types = append(types, EventTypeClockTimeUpdated)
 	}
@@ -660,9 +878,51 @@ func (e *WebSocketEvent) String() string {
 	return fmt.Sprintf("WebSocket Event [Device: %s] - %d events", e.DeviceID, len(eventTypes))
 }
 
+// RootElementName returns the local name of an XML document's root element,
+// skipping any prolog or leading whitespace.
+//
+// Frame dispatch keys off this rather than substring tests: element names
+// share prefixes ("errorUpdate" / "errorUpdated"), attributes may wrap onto
+// the next line, and an element may be self-closing — all of which defeat a
+// needle like "<errorUpdate ".
+func RootElementName(data []byte) (string, error) {
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+
+		if start, ok := token.(xml.StartElement); ok {
+			return start.Name.Local, nil
+		}
+	}
+}
+
 // ParseSpecialMessage parses non-updates WebSocket messages
 func ParseSpecialMessage(data []byte) (*SpecialMessage, error) {
 	dataStr := string(data)
+
+	root, rootErr := RootElementName(data)
+
+	// Check for errorUpdate. Matched on the root element rather than a
+	// substring: "<errorUpdate" is also a prefix of "<errorUpdated", the
+	// (never observed) <updates> child modelled by ErrorUpdatedEvent.
+	if rootErr == nil && root == "errorUpdate" {
+		var errorUpdate ErrorUpdate
+		if err := xml.Unmarshal(data, &errorUpdate); err != nil {
+			return nil, fmt.Errorf("failed to parse errorUpdate: %w", err)
+		}
+
+		return &SpecialMessage{
+			Type:      MessageTypeErrorUpdate,
+			DeviceID:  errorUpdate.DeviceID,
+			Data:      &errorUpdate,
+			RawData:   data,
+			Timestamp: time.Now(),
+		}, nil
+	}
 
 	// Check for SoundTouchSdkInfo
 	if strings.Contains(dataStr, "<SoundTouchSdkInfo") {
@@ -736,6 +996,17 @@ func (sm *SpecialMessage) GetUserActivity() *UserActivityUpdate {
 	return nil
 }
 
+// GetErrorUpdate returns the parsed ErrorUpdate data if the message is of that type
+func (sm *SpecialMessage) GetErrorUpdate() *ErrorUpdate {
+	if sm.Type == MessageTypeErrorUpdate {
+		if errorUpdate, ok := sm.Data.(*ErrorUpdate); ok {
+			return errorUpdate
+		}
+	}
+
+	return nil
+}
+
 // GetUserInactivity returns the parsed UserInactivity data if the message is of that type
 func (sm *SpecialMessage) GetUserInactivity() *UserInactivityUpdate {
 	if sm.Type == MessageTypeUserInactivity {
@@ -758,6 +1029,17 @@ func (sm *SpecialMessage) String() string {
 		return fmt.Sprintf("User Activity [Device: %s]", sm.DeviceID)
 	case MessageTypeUserInactivity:
 		return fmt.Sprintf("User Inactivity [Device: %s]", sm.DeviceID)
+	case MessageTypeErrorUpdate:
+		if errorUpdate := sm.GetErrorUpdate(); errorUpdate != nil {
+			return fmt.Sprintf(
+				"Device Error [Device: %s] - %s (%s), severity %s: %s",
+				sm.DeviceID,
+				errorUpdate.Error.Name,
+				errorUpdate.Error.Value,
+				errorUpdate.Error.Severity,
+				strings.TrimSpace(errorUpdate.Error.Text),
+			)
+		}
 	}
 
 	return fmt.Sprintf("Unknown Special Message - Type: %s", sm.Type)

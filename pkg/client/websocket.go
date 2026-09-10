@@ -34,6 +34,9 @@ type WebSocketClient struct {
 
 	transportHandler    func(connected bool, generation uint64)
 	transportGeneration uint64
+
+	// pending correlates in-flight Request calls with their replies.
+	pending *pendingRequests
 }
 
 type webSocketDialContext func(context.Context, string, http.Header) (*websocket.Conn, *http.Response, error)
@@ -106,6 +109,7 @@ func (c *Client) NewWebSocketClient(config *WebSocketConfig) *WebSocketClient {
 		cancel:     cancel,
 		logger:     config.Logger,
 		bufferSize: config.ReadBufferSize,
+		pending:    newPendingRequests(),
 	}
 }
 
@@ -211,6 +215,16 @@ func (ws *WebSocketClient) OnRawMessage(handler models.RawMessageHandler) {
 	defer ws.mu.Unlock()
 
 	ws.handlers.OnRawMessage = handler
+}
+
+// OnDeviceError sets a handler for root-level <errorUpdate> frames — the
+// speaker's own error reports, carrying a numeric code, a symbolic name and a
+// severity. OnSpecialMessage still fires for the same frame.
+func (ws *WebSocketClient) OnDeviceError(handler models.TypedEventHandler[*models.ErrorUpdate]) {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	ws.handlers.OnDeviceError = handler
 }
 
 // OnSpecialMessage sets a handler for special (non-updates) messages
@@ -367,6 +381,10 @@ func (ws *WebSocketClient) Disconnect() error {
 	ws.conn = nil
 	ws.connected = false
 
+	// Wake anything waiting on a reply: the answer is never coming, and a
+	// caller should hear "connection lost" now rather than time out.
+	ws.pending.failAll()
+
 	var (
 		transportHandler    func(bool, uint64)
 		transportGeneration uint64
@@ -414,6 +432,10 @@ func (ws *WebSocketClient) Close() error {
 	conn := ws.conn
 	ws.conn = nil
 	ws.connected = false
+
+	// Wake anything waiting on a reply: the answer is never coming, and a
+	// caller should hear "connection lost" now rather than time out.
+	ws.pending.failAll()
 
 	var (
 		transportHandler    func(bool, uint64)
@@ -477,6 +499,7 @@ func (ws *WebSocketClient) readLoop(config *WebSocketConfig, connection *webSock
 		ws.connection = nil
 		ws.conn = nil
 		ws.connected = false
+		ws.pending.failAll()
 		ws.transportGeneration++
 		transportHandler := ws.transportHandler
 		transportGeneration := ws.transportGeneration
@@ -590,6 +613,13 @@ func (ws *WebSocketClient) attemptReconnect(config *WebSocketConfig) {
 
 // handleMessage processes incoming WebSocket messages
 func (ws *WebSocketClient) handleMessage(data []byte) {
+	// A reply to an outstanding Request is consumed here and never reaches
+	// the event handlers: it is an answer to us, not a device notification.
+	if ws.routeResponse(data) {
+		ws.fireRawMessage(data, nil)
+		return
+	}
+
 	// Special (non-updates) messages take their own decode path and
 	// surface raw payloads to the OnRawMessage hook from there, so
 	// observers see exactly one notification per frame.
@@ -636,10 +666,19 @@ func (ws *WebSocketClient) handleSpecialMessage(data []byte) {
 		return
 	}
 
-	// Call handler if set
+	// Call handlers if set. A device error goes to the dedicated typed
+	// handler first, then to the catch-all, so a caller may register
+	// either or both.
 	ws.mu.RLock()
 	handler := ws.handlers.OnSpecialMessage
+	deviceErrHandler := ws.handlers.OnDeviceError
 	ws.mu.RUnlock()
+
+	if deviceErrHandler != nil {
+		if errorUpdate := specialMessage.GetErrorUpdate(); errorUpdate != nil {
+			deviceErrHandler(errorUpdate)
+		}
+	}
 
 	if handler != nil {
 		handler(specialMessage)
@@ -691,6 +730,13 @@ func (ws *WebSocketClient) dispatchTypedEvent(handlers *models.WebSocketEventHan
 
 func (ws *WebSocketClient) dispatchTypedEventContinued(handlers *models.WebSocketEventHandlers, eventType models.WebSocketEventType, event *models.WebSocketEvent) bool {
 	switch eventType {
+	case models.EventTypeBalanceUpdated:
+		if handlers.OnBalanceUpdated != nil && event.BalanceUpdated != nil {
+			handlers.OnBalanceUpdated(event.BalanceUpdated)
+		}
+
+		return true
+
 	case models.EventTypeZoneUpdated:
 		if handlers.OnZoneUpdated != nil && event.ZoneUpdated != nil {
 			handlers.OnZoneUpdated(event.ZoneUpdated)

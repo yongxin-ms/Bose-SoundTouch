@@ -1,13 +1,41 @@
 import { h } from 'preact';
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useMemo } from 'preact/hooks';
 import htm from 'htm';
 import { api } from '../api.js';
+import { throttleTrailing, SLIDER_WRITE_INTERVAL_MS } from '../throttle.mjs';
 
 const html = htm.bind(h);
 
 // Flat SVG icons using stroke/fill="currentColor" so they automatically
 // follow the button's text colour in light mode, dark mode, and in the
 // accent-inverted active state — no CSS filter needed.
+
+function IconPrev() {
+    return html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polygon points="19 20 9 12 19 4 19 20"/>
+        <line x1="5" y1="19" x2="5" y2="5"/>
+    </svg>`;
+}
+
+function IconNext() {
+    return html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polygon points="5 4 15 12 5 20 5 4"/>
+        <line x1="19" y1="5" x2="19" y2="19"/>
+    </svg>`;
+}
+
+function IconPlay() {
+    return html`<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <polygon points="6 3 20 12 6 21 6 3"/>
+    </svg>`;
+}
+
+function IconPause() {
+    return html`<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="6" y="4" width="4" height="16"/>
+        <rect x="14" y="4" width="4" height="16"/>
+    </svg>`;
+}
 
 function IconVolume({ muted = false, size = 20 }) {
     if (muted) {
@@ -43,6 +71,13 @@ function IconRepeat({ one = false }) {
     </svg>`;
 }
 
+// balanceLabel renders a level as a side rather than a bare signed number:
+// "L3" reads better than "-3" on a control whose whole point is left/right.
+function balanceLabel(level) {
+    if (level === 0) return 'C';
+    return level < 0 ? `L${-level}` : `R${level}`;
+}
+
 export function Controls({ deviceId, status }) {
     const np = status?.nowPlaying;
     const isPlaying = np?.PlayStatus === 'PLAY_STATE';
@@ -53,24 +88,51 @@ export function Controls({ deviceId, status }) {
     const actualBass = status?.bass?.TargetBass ?? 0;
     const hasBass = status?.bass != null;
 
+    // Balance belongs to a stereo pair and lives on its master, so the server
+    // only reports it when it actually applies here. The bounds come from the
+    // speaker (a SoundTouch 10 pair reports -7..7) rather than being assumed.
+    const balance = status?.balance;
+    const hasBalance = balance != null && balance.Available;
+    const actualBalance = balance?.Target ?? 0;
+    const balanceMin = balance?.Min ?? 0;
+    const balanceMax = balance?.Max ?? 0;
+
     const [localVolume, setLocalVolume] = useState(actualVolume);
     const [localBass, setLocalBass] = useState(actualBass);
+    const [localBalance, setLocalBalance] = useState(actualBalance);
 
     useEffect(() => { setLocalVolume(actualVolume); }, [actualVolume]);
     useEffect(() => { setLocalBass(actualBass); }, [actualBass]);
+    useEffect(() => { setLocalBalance(actualBalance); }, [actualBalance]);
 
     const send = (key) => api.key(deviceId, key);
+
+    // One throttle per slider per mount. The local state still updates on every
+    // input, so the handle keeps up with the pointer; only the network write is
+    // rate-limited.
+    const writeVolume = useMemo(() => throttleTrailing(
+        (id, val) => api.volume(id, val), SLIDER_WRITE_INTERVAL_MS), []);
+    const writeBass = useMemo(() => throttleTrailing(
+        (id, val) => api.bass(id, val), SLIDER_WRITE_INTERVAL_MS), []);
+    const writeBalance = useMemo(() => throttleTrailing(
+        (id, val) => api.balance(id, val), SLIDER_WRITE_INTERVAL_MS), []);
 
     function onVolumeChange(e) {
         const val = parseInt(e.target.value, 10);
         setLocalVolume(val);
-        api.volume(deviceId, val);
+        writeVolume(deviceId, val);
     }
 
     function onBassChange(e) {
         const val = parseInt(e.target.value, 10);
         setLocalBass(val);
-        api.bass(deviceId, val);
+        writeBass(deviceId, val);
+    }
+
+    function onBalanceChange(e) {
+        const val = parseInt(e.target.value, 10);
+        setLocalBalance(val);
+        writeBalance(deviceId, val);
     }
 
     function toggleShuffle() {
@@ -86,18 +148,27 @@ export function Controls({ deviceId, status }) {
     return html`
         <div class="controls">
             <div class="transport">
-                <button class="ctrl-btn" onClick=${() => send('PREV_TRACK')} title="Previous">⏮</button>
-                <button class="ctrl-btn play-btn" onClick=${() => send(isPlaying ? 'PAUSE' : 'PLAY')}>
-                    ${isPlaying ? '⏸' : '▶'}
+                <button class="ctrl-btn" onClick=${() => send('PREV_TRACK')} title="Previous" aria-label="Previous">
+                    ${IconPrev()}
                 </button>
-                <button class="ctrl-btn" onClick=${() => send('NEXT_TRACK')} title="Next">⏭</button>
-                <button class="ctrl-btn ${isMuted ? 'active' : ''}" onClick=${() => send('MUTE')} title="Mute">
+                <button
+                    class="ctrl-btn play-btn"
+                    onClick=${() => send(isPlaying ? 'PAUSE' : 'PLAY')}
+                    title=${isPlaying ? 'Pause' : 'Play'}
+                    aria-label=${isPlaying ? 'Pause' : 'Play'}
+                >
+                    ${isPlaying ? IconPause() : IconPlay()}
+                </button>
+                <button class="ctrl-btn" onClick=${() => send('NEXT_TRACK')} title="Next" aria-label="Next">
+                    ${IconNext()}
+                </button>
+                <button class="ctrl-btn ${isMuted ? 'active' : ''}" onClick=${() => send('MUTE')} title="Mute" aria-label="Mute" aria-pressed=${isMuted}>
                     ${IconVolume({ muted: isMuted })}
                 </button>
-                <button class="ctrl-btn ${shuffle === 'SHUFFLE_ON' ? 'active' : ''}" onClick=${toggleShuffle} title="Shuffle">
+                <button class="ctrl-btn ${shuffle === 'SHUFFLE_ON' ? 'active' : ''}" onClick=${toggleShuffle} title="Shuffle" aria-label="Shuffle" aria-pressed=${shuffle === 'SHUFFLE_ON'}>
                     ${IconShuffle()}
                 </button>
-                <button class="ctrl-btn ${repeat !== 'REPEAT_OFF' ? 'active' : ''}" onClick=${cycleRepeat} title=${repeat === 'REPEAT_ONE' ? 'Repeat one' : repeat === 'REPEAT_ALL' ? 'Repeat all' : 'Repeat'}>
+                <button class="ctrl-btn ${repeat !== 'REPEAT_OFF' ? 'active' : ''}" onClick=${cycleRepeat} title=${repeat === 'REPEAT_ONE' ? 'Repeat one' : repeat === 'REPEAT_ALL' ? 'Repeat all' : 'Repeat'} aria-label=${repeat === 'REPEAT_ONE' ? 'Repeat one' : repeat === 'REPEAT_ALL' ? 'Repeat all' : 'Repeat'} aria-pressed=${repeat !== 'REPEAT_OFF'}>
                     ${IconRepeat({ one: repeat === 'REPEAT_ONE' })}
                 </button>
             </div>
@@ -113,6 +184,15 @@ export function Controls({ deviceId, status }) {
                     <input type="range" class="volume-slider" min="-9" max="9"
                         value=${localBass} onInput=${onBassChange} />
                     <span class="volume-value">${localBass > 0 ? '+' : ''}${localBass}</span>
+                </div>
+            `}
+            ${hasBalance && html`
+                <div class="bass-row">
+                    <span class="bass-label" title="Left / right balance for this stereo pair">L/R</span>
+                    <input type="range" class="volume-slider"
+                        min=${balanceMin} max=${balanceMax}
+                        value=${localBalance} onInput=${onBalanceChange} />
+                    <span class="volume-value">${balanceLabel(localBalance)}</span>
                 </div>
             `}
         </div>
