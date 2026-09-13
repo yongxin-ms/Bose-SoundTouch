@@ -3,10 +3,11 @@ import { useState, useEffect } from 'preact/hooks';
 import htm from 'htm';
 import { api } from '../api.js';
 import { SourceIcon } from '../sourceIcons.js';
+import { artworkFor, presetArtIndex } from '../recentsArt.mjs';
 
 const html = htm.bind(h);
 
-export function Recents({ deviceId }) {
+export function Recents({ deviceId, presets, command, commandBusy = false, onPlay }) {
     const [items, setItems] = useState(null);
     const [loading, setLoading] = useState(true);
 
@@ -29,6 +30,10 @@ export function Recents({ deviceId }) {
     if (!items || items.length === 0) return null;
 
     function play(item) {
+        if (onPlay) {
+            onPlay(item);
+            return;
+        }
         const ci = item.ContentItem;
         if (!ci?.Location) return;
         api.play(deviceId, {
@@ -42,6 +47,10 @@ export function Recents({ deviceId }) {
         });
     }
 
+    // The speaker sends no artwork with recents; a preset for the same content
+    // is the one place the player can borrow it from. See recentsArt.mjs.
+    const artIndex = presetArtIndex(presets);
+
     return html`
         <div class="recents-section">
             <div class="section-title">Recents</div>
@@ -49,10 +58,19 @@ export function Recents({ deviceId }) {
                 ${items.map(item => {
                     const ci = item.ContentItem;
                     if (!ci) return null;
+                    const art = artworkFor(ci, artIndex);
                     return html`
-                        <button class="recent-item" key=${item.ID || item.UTCTime} onClick=${() => play(item)}>
-                            ${ci.ContainerArt
-                                ? html`<img class="recent-art" src=${ci.ContainerArt} alt="" />`
+                        <button
+                            class="recent-item"
+                            key=${item.ID || item.UTCTime}
+                            onClick=${() => play(item)}
+                            disabled=${commandBusy}
+                            aria-busy=${command?.action === 'recent' && commandBusy &&
+                                command?.expected?.targetId === String(item.ID || item.UTCTime || ci.Location)
+                                ? 'true' : null}
+                        >
+                            ${art
+                                ? html`<img class="recent-art" src=${art} alt="" />`
                                 : html`<div class="recent-art recent-art-empty"><${SourceIcon} source=${ci.Source} className="recent-source-icon" /></div>`
                             }
                             <div class="recent-info">

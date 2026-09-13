@@ -127,6 +127,13 @@ type WebApp struct {
 	// mutation lock covers concurrent CLI-like requests from every browser.
 	StereoPairs StereoPairLifecycle
 
+	// mediaServers caches the ContentDirectory of each DLNA server behind a
+	// STORED_MUSIC account, keyed by bare UDN (see mediaServerForAccount). It
+	// exists so the album-art lookup on a preset save costs one SOAP call
+	// instead of also re-resolving the server every time.
+	mediaServersMu sync.Mutex
+	mediaServers   map[string]cachedMediaServer
+
 	discoveryStatus atomic.Value // stores *webtypes.DiscoveryStatus
 }
 
@@ -724,6 +731,95 @@ func (app *WebApp) handleStorePreset(w http.ResponseWriter, r *http.Request, dev
 
 	err = device.Client.StoreCurrentAsPreset(presetID)
 	app.sendControlResponse(w, err, fmt.Sprintf("Stored current as preset %d", presetID))
+}
+
+// HandleStorePresetContent stores an explicitly named ContentItem in a preset
+// slot, without requiring that content to be playing first.
+//
+// The speaker's own /storePreset endpoint takes the ContentItem, so naming the
+// content is enough — the same path `soundtouch-cli preset store` has always
+// used. handleStorePreset above reaches for StoreCurrentAsPreset, which reads
+// /now_playing instead, and that is the only reason saving something from a
+// browser used to require playing it first (issue 700).
+//
+// Verified on hardware for the awkward case, a STORED_MUSIC folder: the
+// speaker accepted a ContentItem carrying no type attribute at all, and
+// recalling the preset played the folder from its first track. The speaker
+// then PUT the new preset back to AfterTouch's marge endpoint on its own, so
+// the datastore picks it up without this handler writing anything.
+func (app *WebApp) HandleStorePresetContent(w http.ResponseWriter, r *http.Request) {
+	deviceID := chi.URLParam(r, "id")
+
+	device, exists := app.GetDevice(deviceID)
+	if !exists {
+		app.sendError(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	if device.Client == nil {
+		app.sendError(w, "Device client not available", http.StatusInternalServerError)
+		return
+	}
+
+	slot, err := strconv.Atoi(chi.URLParam(r, "slot"))
+	if err != nil || slot < 1 || slot > 6 {
+		app.sendError(w, "Preset slot must be between 1 and 6", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		Source        string `json:"source"`
+		Type          string `json:"type"`
+		Location      string `json:"location"`
+		SourceAccount string `json:"sourceAccount"`
+		ItemName      string `json:"itemName"`
+		ContainerArt  string `json:"containerArt"`
+	}
+
+	if decErr := json.NewDecoder(r.Body).Decode(&req); decErr != nil {
+		app.sendError(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Source == "" {
+		app.sendError(w, "source is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Location == "" {
+		app.sendError(w, "location is required", http.StatusBadRequest)
+		return
+	}
+
+	contentItem := &models.ContentItem{
+		Source:       req.Source,
+		Type:         req.Type,
+		Location:     req.Location,
+		ItemName:     req.ItemName,
+		ContainerArt: req.ContainerArt,
+		// A preset the speaker stores for itself is presetable by definition;
+		// saying otherwise would have it refuse its own entry on recall.
+		IsPresetable: true,
+	}
+
+	// Only pass SourceAccount when it's a real credential, not the placeholder
+	// value speakers echo back (source name == source account, e.g. "TUNEIN").
+	if req.SourceAccount != "" && req.SourceAccount != req.Source {
+		contentItem.SourceAccount = req.SourceAccount
+	}
+
+	// A library item has no artwork by the time it reaches us: the speaker's
+	// /navigate carries none, so a saved folder showed a generic tile even
+	// though the same folder playing showed its cover. Ask the media server
+	// for it, best effort (see storedMusicArtURL).
+	if contentItem.ContainerArt == "" && req.Source == "STORED_MUSIC" {
+		contentItem.ContainerArt = app.storedMusicArtURL(r.Context(), device, contentItem.SourceAccount, contentItem.Location)
+	}
+
+	logPlaybackRequest("store-preset", deviceID, contentItem.Source, contentItem.SourceAccount, contentItem.Location, contentItem.ItemName)
+
+	err = device.Client.StorePreset(slot, contentItem)
+	app.sendControlResponse(w, err, fmt.Sprintf("Stored %s as preset %d", req.Source, slot))
 }
 
 // handleBassControl processes bass control requests
@@ -1592,16 +1688,35 @@ func (app *WebApp) HandleDeviceRecents(w http.ResponseWriter, r *http.Request) {
 }
 
 // storedMusicTypeForReplay derives a STORED_MUSIC ContentItem type from the
-// speaker-native location, which ends with the item kind (e.g. "1$4$2 TRACK"
-// or a container's "… DIR"). Recents don't store the type, and the speaker
-// rejects an empty-type STORED_MUSIC select with INVALID_SOURCE. Falls back to
-// "track" when the location has no kind suffix.
+// speaker-native location. Recents don't store the type, and the speaker
+// rejects an empty-type STORED_MUSIC select with INVALID_SOURCE.
+//
+// An explicit kind suffix is honoured; everything else is a container.
+// Measured on a SoundTouch 10 (FW 27.0.6) against two independent media
+// servers, plus a third shape from the issue 702 report:
+//
+//	tracks      "1$0 TRACK", "5:audio5:part13:3171:5 TRACK"
+//	containers  "1", "4:cont1:20:0:0:", "22$2935"
+//
+// Track locations reliably carry the suffix on every server seen; container
+// locations never do, and the " DIR" suffix this function's first version
+// assumed was not produced by any of them.
+//
+// The fallback therefore points at "dir", not "track" (issue 702). It used to
+// be "track", which silently mis-typed every folder recent: replaying one
+// selected a directory as a track, and the failure surfaced at play time
+// rather than at write time. The remaining exposure is a server that emits
+// track locations without the suffix, which would now be typed as a
+// container; none of the three seen does. Keeping the real type instead of
+// deriving it would remove the guess altogether, since /navigate reports the
+// kind in the item's <type> element and nowSelectionUpdated carries
+// type="dir" explicitly.
 func storedMusicTypeForReplay(location string) string {
 	if fields := strings.Fields(location); len(fields) >= 2 {
 		return strings.ToLower(fields[len(fields)-1])
 	}
 
-	return "track"
+	return "dir"
 }
 
 // HandleDevicePlay plays an arbitrary content item on a device. Generic
@@ -1753,7 +1868,12 @@ func (app *WebApp) HandlePlayURL(w http.ResponseWriter, r *http.Request) {
 
 	if encErr := json.NewEncoder(w).Encode(webtypes.APIResponse{
 		Success: true,
-		Data:    map[string]string{"message": "Playing " + req.Name},
+		Data: map[string]string{
+			"message":  "Playing " + req.Name,
+			"source":   contentItem.Source,
+			"location": contentItem.Location,
+			"itemName": contentItem.ItemName,
+		},
 	}); encErr != nil {
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 	}

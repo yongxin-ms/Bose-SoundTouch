@@ -133,6 +133,132 @@ A rejected write is not always proof the command never landed:
   already switched looks identical to one it never received. The readbacks
   keep running and the reason is carried into whatever outcome they reach.
 
+## Track skips: what can be verified
+
+A skip is confirmed by watching *what is playing* change, and picking the wrong
+field gets it wrong in both directions. `track` and `stationName` are the
+obvious candidates and the wrong ones: a live stream rewrites its own title
+while the same stream keeps playing, so a skip that did nothing looks
+confirmed. `trackID` is a stable per-track identity (`spotify:track:...` in the
+captured firmware responses), so it stays put through a title rewrite and moves
+on a real skip.
+
+Not every source reports one. A media library skips perfectly well while
+reporting no `trackID` at all, and there its track metadata is the signal,
+because a library's title changes only when the track really changes. Live
+radio changes its title on its own and can skip nothing, so there no readback
+can ever say anything, and the player settles the command on a write the
+speaker accepted rather than holding the transport disabled for the whole
+readback window only to report "unverified".
+
+| What the speaker reports          | Player behaviour                  |
+|-----------------------------------|-----------------------------------|
+| a `trackID`                       | verify the skip against it        |
+| no `trackID`, but `skipEnabled`   | verify against the track metadata |
+| neither                           | settle on the accepted write      |
+
+The middle row is why `skipEnabled` / `skipPreviousEnabled` (parsed as
+`models.CanSkip` / `models.CanSkipPrevious`) matter: a media library changes
+its track title only when the track really changes, and says so by claiming
+skip support, while live radio rewrites its title with the same stream playing
+on and claims no skip support at all. The claim is what tells the two apart,
+and without it a whole source would be unverifiable. The metadata identity is
+`track`, `artist`, `album` and the ContentItem's `location` together.
+
+The flags are **not** used to enable or disable the skip buttons, deliberately:
+they flap while a source buffers. The same Spotify track reported
+`skipPreviousEnabled` false mid-buffer and true a few seconds later, and
+Spotify reported no `trackID` at all during one buffering window, so buttons
+driven by them would flicker.
+
+### Previous-track restarts before it steps back
+
+The first `PREV_TRACK` restarts the track that is playing; only a second press
+moves to the previous one. Measured on a SoundTouch 10 against a media library:
+at position 97s a press left the track and the queue offset untouched and reset
+the position to 0, and a press five seconds later stepped from track 10 to
+track 09. Pressing from a track that has just begun steps back immediately,
+since there is nothing to restart: a walk back through a whole album, each
+press landing at position 0 or 1, moved one track per press from 10 down to 01.
+
+`NEXT_TRACK` has no such rule and always advances.
+
+This matters twice over. It looks like a broken Previous button when a track is
+well under way, and it defeats any confirmation based on identity, because a
+restart changes no track, no `trackID` and no metadata. The player therefore
+also accepts a play position that has moved backwards as a confirmed
+`previous-track`. Nothing about it is specific to a source or a queue position:
+there is no "first track of the queue" border, and an album selected as a
+container keeps every track before the current one available.
+
+### What the hardware reports
+
+Measured on a SoundTouch 10 (server version 4) by walking its sources:
+
+| Source                 | `trackID` | `skipEnabled` | `skipPreviousEnabled` | Skip confirmed by  |
+|------------------------|-----------|---------------|-----------------------|--------------------|
+| `SPOTIFY`              | yes       | yes           | yes                   | `trackID`          |
+| `STORED_MUSIC`         | no        | yes           | yes                   | track metadata     |
+| `TUNEIN`               | no        | no            | no                    | nothing: the write |
+| `RADIO_BROWSER`        | no        | no            | no                    | nothing: the write |
+| `AUX`                  | no        | no            | no                    | nothing: the write |
+| `LOCAL_INTERNET_RADIO` | ?         | ?             | ?                     | ?                  |
+| `BLUETOOTH`            | ?         | ?             | ?                     | ?                  |
+
+`STORED_MUSIC` is the case the design turns on: it skips perfectly well and
+says so, but reports no `trackID`, so a trackID-only rule would leave an entire
+source unverifiable. It was measured against this repository's own
+`cmd/example-dlna-server`; another media server may report a `trackID`, and
+nothing guarantees either way. That is why a `trackID` is preferred wherever
+one is present and the metadata path is only the fallback.
+
+The reports are not stable moment to moment. Mid-buffer, the same Spotify track
+reported `skipPreviousEnabled` false and, in a later buffering window, no
+`trackID` at all. The player reads these only at the moment the button is
+pressed, so a press inside such a window simply settles on the write.
+
+Both passes below are worth repeating on other hardware, other firmware and
+other media servers. The first collects what each source *reports*, by watching
+while you switch sources on the speaker or in the Bose app:
+
+```bash
+soundtouch-cli --host <speaker> play capabilities --watch
+```
+
+It prints one row per observation and a new row whenever the report changes, so
+one run covers every source you visit. A radio stream rewriting its own title
+while the `trackID` stays put shows up here as a new row too, which is the
+behaviour that rules the title out as a confirmation signal.
+
+Reporting a `trackID` is not the same as that `trackID` moving when a skip
+happens, and only the second is what the player relies on. The second pass
+measures it, once per source, while that source is playing:
+
+```bash
+soundtouch-cli --host <speaker> play capabilities --probe-skip
+```
+
+That really does skip a track: it sends one `NEXT_TRACK`, watches for up to
+`--probe-wait` (6s by default), prints the before and after rows, and states
+whether the `trackID` moved, whether only the title moved, or whether nothing
+changed. Add what you find to the table above.
+
+Still open:
+
+- `LOCAL_INTERNET_RADIO` and `BLUETOOTH` have not been observed at all.
+- The probe pass has not been run per source. Reporting a `trackID` is not the
+  same as that `trackID` moving on a skip, and the table's right-hand column is
+  so far an inference from the first pass rather than a measurement.
+- Media servers other than this repository's `cmd/example-dlna-server` may
+  report a `trackID` for `STORED_MUSIC`, which would simply move that source
+  onto the `trackID` path.
+
+Two findings would change the player: a source reporting a `trackID` that does
+not move across a real skip (the readback would have to stop trusting it
+there), and a source that claims `skipEnabled` while rewriting its track
+metadata on its own (that would break the metadata fallback the way the title
+broke the original rule).
+
 ## Ordering: revisions and epochs
 
 Status reaches the browser three ways — a full `devices` snapshot, a

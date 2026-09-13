@@ -22,7 +22,7 @@ layout: hextra-home
 </div>
 
 <div class="hx-mb-6">
-{{< hextra/hero-button text="Get Started" link="docs/guides/MIGRATION-GUIDE" >}}
+{{< hextra/hero-button text="Get Started" link="docs/guides/GETTING-STARTED" >}}
 {{< hextra/hero-button text="Survival Guide" link="docs/guides/SURVIVAL-GUIDE" style="outline" >}}
 </div>
 
@@ -32,6 +32,7 @@ layout: hextra-home
     title="Presets Restored"
     subtitle="Preset buttons, long-press assignment, and recently-played sync — fully working."
     icon="star"
+    link="docs/guides/PRESETS"
   >}}
   {{< hextra/feature-card
     title="Music Browsing"
@@ -40,7 +41,7 @@ layout: hextra-home
   >}}
   {{< hextra/feature-card
     title="Stereo Pairing"
-    subtitle="SoundTouch 10 stereo pairing via soundtouch-cli, no Bose cloud required."
+    subtitle="SoundTouch 10 stereo pairing via soundtouch-player and soundtouch-cli, no Bose cloud required."
     icon="adjustments"
   >}}
   {{< hextra/feature-card

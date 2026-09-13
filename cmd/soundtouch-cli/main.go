@@ -304,6 +304,37 @@ func main() {
 						},
 					},
 					{
+						Name:   "capabilities",
+						Usage:  "Report what the current source says about skipping (trackID, skipEnabled, seek)",
+						Action: playbackCapabilities,
+						Before: RequireHost,
+						Flags: []cli.Flag{
+							&cli.BoolFlag{
+								Name:    "watch",
+								Aliases: []string{"w"},
+								Usage:   "Keep polling and print a row whenever the speaker reports something different",
+							},
+							&cli.DurationFlag{
+								Name:  "interval",
+								Value: 2 * time.Second,
+								Usage: "Poll interval while watching",
+							},
+							&cli.DurationFlag{
+								Name:  "duration",
+								Usage: "Stop watching after this long (default: until interrupted)",
+							},
+							&cli.BoolFlag{
+								Name:  "probe-skip",
+								Usage: "Send one NEXT_TRACK and report what it changed (this really skips a track)",
+							},
+							&cli.DurationFlag{
+								Name:  "probe-wait",
+								Value: 6 * time.Second,
+								Usage: "How long to watch for a change after the probe's skip",
+							},
+						},
+					},
+					{
 						Name:   "start",
 						Usage:  "Start playback",
 						Action: playCommand,
@@ -1308,7 +1339,7 @@ func main() {
 							&cli.IntFlag{
 								Name:     "level",
 								Aliases:  []string{"l"},
-								Usage:    "Balance level (-50 to 50, negative=left, positive=right)",
+								Usage:    "Balance level within the range the speaker reports (-7 to 7 on a SoundTouch 10); negative=left, positive=right",
 								Required: true,
 							},
 						},
@@ -1322,7 +1353,7 @@ func main() {
 							&cli.IntFlag{
 								Name:    "amount",
 								Aliases: []string{"a"},
-								Usage:   "Amount to shift left (1-10, default: 5)",
+								Usage:   "Amount to shift left, clamped to the speaker's reported range",
 								Value:   5,
 							},
 						},
@@ -1336,7 +1367,7 @@ func main() {
 							&cli.IntFlag{
 								Name:    "amount",
 								Aliases: []string{"a"},
-								Usage:   "Amount to shift right (1-10, default: 5)",
+								Usage:   "Amount to shift right, clamped to the speaker's reported range",
 								Value:   5,
 							},
 						},

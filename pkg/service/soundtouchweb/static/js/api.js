@@ -45,6 +45,12 @@ export const api = {
     removeDevice: (id) => req(`/api/control/devices/${id}`, { method: 'DELETE' }),
     discover: () => req('/api/control/discover', { method: 'POST' }),
     key: (id, key) => req(`/api/control/devices/${id}/key/${key}`, { method: 'POST' }),
+    // Checked variants of the mutations the discrete-command hook issues. They
+    // send the same request, but surface the failure and whether it is
+    // definitive, which is what tells the hook to stop verifying (see
+    // checkedReq). The plain forms keep their response-level behaviour for the
+    // callers that already rely on it.
+    keyChecked: (id, key) => checkedReq(`/api/control/devices/${id}/key/${key}`, { method: 'POST' }),
     volume: (id, level) => req(`/api/control/devices/${id}/volume/${level}`, { method: 'POST' }),
     bass: (id, level) => req(`/api/control/devices/${id}/action/bass`, {
         method: 'POST',
@@ -57,6 +63,7 @@ export const api = {
         body: JSON.stringify({ level }),
     }),
     power: (id) => req(`/api/control/devices/${id}/power`, { method: 'POST' }),
+    powerChecked: (id) => checkedReq(`/api/control/devices/${id}/power`, { method: 'POST' }),
     recents: (id) => req(`/api/control/devices/${id}/recents`),
     zone: (id) => req(`/api/control/devices/${id}/zone`),
     zoneCandidates: (id) => req(`/api/control/devices/${id}/zone/candidates`),
@@ -98,7 +105,15 @@ export const api = {
     tuneInSearch: (q) => req(`/api/control/providers/tunein/search?q=${encodeURIComponent(q)}`),
     tuneInSearchNext: (cursor) => req(`/api/control/providers/tunein/search/next?cursor=${encodeURIComponent(cursor)}`),
     control: (id, action, presetId) => req(`/api/control/devices/${id}/action/${action}?id=${presetId}`),
+    controlChecked: (id, action, presetId) => checkedReq(`/api/control/devices/${id}/action/${action}?id=${presetId}`),
     storePreset: (id, slotId) => req(`/api/control/devices/${id}/action/storepreset?id=${slotId}`),
+    // Stores named content rather than whatever is playing, so a Library row
+    // can be saved to a slot without interrupting playback (issue 700).
+    storePresetContent: (id, slotId, item) => req(`/api/control/devices/${id}/preset/${slotId}`, {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify(item),
+    }),
     selectSource: (id, source, account) => checkedReq(`/api/control/devices/${id}/action/source`, {
         method: 'POST',
         headers: JSON_HEADERS,
@@ -109,13 +124,28 @@ export const api = {
         headers: JSON_HEADERS,
         body: JSON.stringify(item),
     }),
+    tuneInPlayChecked: (deviceId, item) => checkedReq(`/api/control/devices/${deviceId}/providers/tunein/play`, {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify(item),
+    }),
     radioBrowserSearch: (q) => req(`/api/control/providers/radiobrowser/search?q=${encodeURIComponent(q)}`),
     radioBrowserPlay: (deviceId, item) => req(`/api/control/devices/${deviceId}/providers/radiobrowser/play`, {
         method: 'POST',
         headers: JSON_HEADERS,
         body: JSON.stringify(item),
     }),
+    radioBrowserPlayChecked: (deviceId, item) => checkedReq(`/api/control/devices/${deviceId}/providers/radiobrowser/play`, {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify(item),
+    }),
     playURL: (deviceId, url, name, imageUrl, serviceUrl) => req(`/api/control/devices/${deviceId}/providers/url/play`, {
+        method: 'POST',
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ url, name, imageUrl, serviceUrl }),
+    }),
+    playURLChecked: (deviceId, url, name, imageUrl, serviceUrl) => checkedReq(`/api/control/devices/${deviceId}/providers/url/play`, {
         method: 'POST',
         headers: JSON_HEADERS,
         body: JSON.stringify({ url, name, imageUrl, serviceUrl }),
@@ -128,6 +158,9 @@ export const api = {
     libraryDiscover: (timeout) => req(`/api/control/providers/library/servers${timeout ? `?timeout=${timeout}` : ''}`),
     libraryServers: (id) => req(`/api/control/devices/${id}/library/servers`),
     libraryAddServer: (id, body) => req(`/api/control/devices/${id}/library/servers`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }),
+    // Nudges the speaker to re-read its sources, then returns what it has
+    // (issue 580: a media server can vanish from one speaker's list).
+    libraryRefreshServers: (id) => req(`/api/control/devices/${id}/library/servers/refresh`, { method: 'POST' }),
     libraryRemoveServer: (id, account) => req(`/api/control/devices/${id}/library/servers/${encodeURIComponent(account)}`, { method: 'DELETE' }),
     libraryBrowse: (id, { account, location, type, start, count }) => {
         const qs = [
@@ -140,4 +173,5 @@ export const api = {
         return req(`/api/control/devices/${id}/library/browse?${qs}`);
     },
     libraryPlay: (id, body) => req(`/api/control/devices/${id}/library/play`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }),
+    libraryPlayChecked: (id, body) => checkedReq(`/api/control/devices/${id}/library/play`, { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify(body) }),
 };

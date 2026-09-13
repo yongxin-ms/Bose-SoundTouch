@@ -2,6 +2,7 @@ package soundtouchweb
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -15,6 +16,26 @@ import (
 	"github.com/gesellix/bose-soundtouch/pkg/service/soundtouchweb/webtypes"
 	"github.com/go-chi/chi/v5"
 )
+
+// defaultLibraryPageSize is how many items one browse asks the speaker for
+// when the caller does not say.
+//
+// The speaker honours numItems well past this (measured on a SoundTouch 10
+// against a 484-entry folder: 200, 400 and 1000 all came back correctly, the
+// last one with every entry), so a larger page costs response size rather than
+// correctness. 500 covers most real folders in one request while leaving the
+// paging path in use for the libraries that need it (issue 583).
+//
+// A named constant because the right value depends on the library and on how
+// the browser handles a long list, so this is a likely candidate for a setting
+// later.
+const defaultLibraryPageSize = 500
+
+// sourcesUpdatedSettleDelay is how long a refresh waits between telling a
+// speaker its sources changed and asking what it now has. Measured informally:
+// a speaker acts on the notification within a second. Too short and the
+// re-read returns the list we already had; too long and the UI feels stuck.
+const sourcesUpdatedSettleDelay = 1500 * time.Millisecond
 
 // libraryServer is the JSON DTO for a DLNA media server. The registered and
 // ready fields reflect state on the specific speaker that was queried;
@@ -40,6 +61,18 @@ type libraryEntry struct {
 	SourceAccount string `json:"sourceAccount"`
 	Playable      bool   `json:"playable"`
 	IsDir         bool   `json:"isDir"`
+
+	// IsPresetable reports the speaker's own isPresetable attribute for this
+	// item, which is what says whether it can be saved to a preset slot. It
+	// was previously dropped here, so the UI had no way to know.
+	//
+	// Read false as "unknown", not "no": models.ContentItem.IsPresetable is a
+	// plain bool, so an absent attribute and an explicit false are the same
+	// value by the time it reaches us. Both media servers measured (a
+	// FRITZ!Box UPnP server and this repo's example-dlna-server) reported
+	// true on every directory and track, so a false in practice means the
+	// attribute was missing.
+	IsPresetable bool `json:"isPresetable"`
 }
 
 // libraryPage wraps a slice of libraryEntry as the Data payload.
@@ -218,6 +251,101 @@ func (app *WebApp) HandleDeviceLibraryServers(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	out := storedMusicServers(sources)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if encErr := json.NewEncoder(w).Encode(webtypes.APIResponse{Success: true, Data: out}); encErr != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
+
+// HandleRefreshLibraryServers re-reads a speaker's STORED_MUSIC sources after
+// asking it to re-read its own account list first.
+//
+// A media server sometimes disappears from one speaker's source list while
+// other speakers still see it (issue 580). Rebooting that speaker brings it
+// back, which says the registration itself survived and only the speaker's
+// live view of it was lost. The same sourcesUpdated nudge that makes a newly
+// registered server appear without a power cycle (see HandleAddLibraryServer)
+// is the cheapest thing that can rebuild that view, so this handler offers it
+// as an explicit gesture rather than making the user reboot.
+//
+// The nudge is best effort and its outcome is reported as "refreshed": the
+// re-read happens either way, so a speaker that ignores the notification still
+// answers with its current list rather than an error. Whether this actually
+// restores a lost library is not confirmed; the reporter of issue 580 has the
+// intermittent case we cannot reproduce here.
+func (app *WebApp) HandleRefreshLibraryServers(w http.ResponseWriter, r *http.Request) {
+	deviceID := chi.URLParam(r, "id")
+
+	device, exists := app.GetDevice(deviceID)
+	if !exists {
+		app.sendError(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	if device.Client == nil {
+		app.sendError(w, "Device client not available", http.StatusInternalServerError)
+		return
+	}
+
+	refreshed := false
+
+	if boseDeviceID := app.boseDeviceID(device); boseDeviceID != "" {
+		if err := device.Client.NotifySourcesUpdated(boseDeviceID); err == nil {
+			refreshed = true
+		} else {
+			slog.Debug("library refresh: sourcesUpdated failed", "err", sanitizeLog(err.Error()))
+		}
+	}
+
+	// Give the speaker a moment to act on the notification before asking what
+	// it now has. Without this the re-read races the speaker's own work and
+	// reports the list we were already showing.
+	if refreshed {
+		select {
+		case <-time.After(sourcesUpdatedSettleDelay):
+		case <-r.Context().Done():
+			return
+		}
+	}
+
+	sources, err := device.Client.GetSources()
+	if err != nil {
+		app.sendError(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	out := storedMusicServers(sources)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if encErr := json.NewEncoder(w).Encode(webtypes.APIResponse{
+		Success: true,
+		Data:    map[string]interface{}{"servers": out, "refreshed": refreshed},
+	}); encErr != nil {
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
+
+// boseDeviceID resolves the speaker's own device ID for notifications,
+// preferring the cached DeviceInfo over a live /info round-trip.
+func (app *WebApp) boseDeviceID(device *webtypes.DeviceConnection) string {
+	if device.DeviceInfo != nil && device.DeviceInfo.DeviceID != "" {
+		return device.DeviceInfo.DeviceID
+	}
+
+	if info, err := device.Client.GetDeviceInfo(); err == nil && info != nil {
+		return info.DeviceID
+	}
+
+	return ""
+}
+
+// storedMusicServers maps a speaker's /sources response to the media servers
+// registered on it.
+func storedMusicServers(sources *models.Sources) []libraryServer {
 	out := make([]libraryServer, 0)
 
 	for _, si := range sources.SourceItem {
@@ -234,11 +362,7 @@ func (app *WebApp) HandleDeviceLibraryServers(w http.ResponseWriter, r *http.Req
 		})
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-
-	if encErr := json.NewEncoder(w).Encode(webtypes.APIResponse{Success: true, Data: out}); encErr != nil {
-		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
-	}
+	return out
 }
 
 // HandleAddLibraryServer registers a DLNA media server on a specific speaker
@@ -375,7 +499,8 @@ func (app *WebApp) HandleRemoveLibraryServer(w http.ResponseWriter, r *http.Requ
 //   - location (optional) location token from a previous browse; empty means root
 //   - type     (optional) type hint for the container item, defaults to "dir"
 //   - start    (optional) 1-based start index, defaults to 1
-//   - count    (optional) number of items to return, defaults to 200
+//   - count    (optional) number of items to return, defaults to
+//     defaultLibraryPageSize
 func (app *WebApp) HandleLibraryBrowse(w http.ResponseWriter, r *http.Request) {
 	deviceID := chi.URLParam(r, "id")
 
@@ -407,7 +532,7 @@ func (app *WebApp) HandleLibraryBrowse(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	count := 200
+	count := defaultLibraryPageSize
 
 	if raw := r.URL.Query().Get("count"); raw != "" {
 		if v, err := strconv.Atoi(raw); err == nil && v >= 1 {
@@ -445,8 +570,14 @@ func (app *WebApp) HandleLibraryBrowse(w http.ResponseWriter, r *http.Request) {
 
 	for _, item := range resp.Items {
 		loc := ""
+		presetable := false
+
+		// The item's own ContentItem, not the one inside mediaItemContainer:
+		// that one repeats the parent container identically on every item.
+		// models.NavigateItem keeps them apart.
 		if item.ContentItem != nil {
 			loc = item.ContentItem.Location
+			presetable = item.ContentItem.IsPresetable
 		}
 
 		entries = append(entries, libraryEntry{
@@ -456,6 +587,7 @@ func (app *WebApp) HandleLibraryBrowse(w http.ResponseWriter, r *http.Request) {
 			SourceAccount: account,
 			Playable:      item.Playable == 1,
 			IsDir:         item.Type == "dir",
+			IsPresetable:  presetable,
 		})
 	}
 

@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gesellix/bose-soundtouch/pkg/models"
 )
@@ -327,30 +328,43 @@ func BenchmarkParseEventFilters(b *testing.B) {
 	}
 }
 
-// Test WebSocket configuration defaults
+// TestWebSocketConfigDefaults pins the tuning the `events` command uses.
+//
+// It reads webSocketConfig rather than restating the numbers: the version
+// before this declared its own local copies and compared those to each other,
+// so every branch was unreachable and the test could not fail no matter what
+// the command actually did.
 func TestWebSocketConfigDefaults(t *testing.T) {
-	// This tests the configuration values used in setupWebSocketClient
-	// We can't easily unit test the actual function without mocking the client
-	// But we can test that our expected defaults are reasonable
-	defaultReconnectInterval := 5000000000 // 5 seconds in nanoseconds
-	defaultPingInterval := 30000000000     // 30 seconds in nanoseconds
-	defaultPongTimeout := 10000000000      // 10 seconds in nanoseconds
-	defaultBufferSize := 2048
+	cfg := webSocketConfig(true, false)
 
-	if defaultReconnectInterval < 1000000000 { // Less than 1 second
-		t.Error("Reconnect interval should be at least 1 second")
+	if cfg.ReconnectInterval != 5*time.Second {
+		t.Errorf("ReconnectInterval = %v, want 5s", cfg.ReconnectInterval)
 	}
 
-	if defaultPingInterval < 10000000000 { // Less than 10 seconds
-		t.Error("Ping interval should be at least 10 seconds")
+	if cfg.PingInterval != 30*time.Second {
+		t.Errorf("PingInterval = %v, want 30s", cfg.PingInterval)
 	}
 
-	if defaultPongTimeout < 1000000000 { // Less than 1 second
-		t.Error("Pong timeout should be at least 1 second")
+	// A pong timeout at or above the ping interval would time out a healthy
+	// connection before its next ping could answer.
+	if cfg.PongTimeout >= cfg.PingInterval {
+		t.Errorf("PongTimeout %v must stay below PingInterval %v", cfg.PongTimeout, cfg.PingInterval)
 	}
 
-	if defaultBufferSize < 1024 {
-		t.Error("Buffer size should be at least 1024 bytes")
+	if cfg.ReadBufferSize < 1024 || cfg.WriteBufferSize < 1024 {
+		t.Errorf("buffer sizes = %d/%d, want at least 1024 each", cfg.ReadBufferSize, cfg.WriteBufferSize)
+	}
+}
+
+// TestWebSocketConfigReconnectToggle covers the one thing webSocketConfig
+// decides rather than declares: --no-reconnect caps the attempts at one.
+func TestWebSocketConfigReconnectToggle(t *testing.T) {
+	if got := webSocketConfig(true, false).MaxReconnectAttempts; got != 0 {
+		t.Errorf("MaxReconnectAttempts with reconnect on = %d, want 0 (unlimited)", got)
+	}
+
+	if got := webSocketConfig(false, false).MaxReconnectAttempts; got != 1 {
+		t.Errorf("MaxReconnectAttempts with reconnect off = %d, want 1", got)
 	}
 }
 
@@ -363,12 +377,9 @@ func TestWebSocketConfigDefaults(t *testing.T) {
 // registering an OnUnknownEvent handler opts out of the client's own fallback
 // log, which was the only other caller.
 func TestHandleUnknownEventNamesTheElement(t *testing.T) {
-	// Captured from a SoundTouch 10 (FW 27.0.6) when a STORED_MUSIC folder is
-	// selected. nowSelectionUpdated is not modelled yet.
-	raw := []byte(`<updates deviceID="DEVICEID01"><nowSelectionUpdated>` +
-		`<preset id="0"><ContentItem source="STORED_MUSIC" type="dir" location="4:cont2:615:part12:39"` +
-		` isPresetable="true"><itemName>Swissgroove</itemName></ContentItem></preset>` +
-		`</nowSelectionUpdated></updates>`)
+	// Any <updates> child we do not model yet. nowSelectionUpdated used to
+	// stand in here and is modelled now, so this uses a name that is not.
+	raw := []byte(`<updates deviceID="DEVICEID01"><someFutureUpdated><whatever/></someFutureUpdated></updates>`)
 
 	event, err := models.ParseWebSocketEvent(raw)
 	if err != nil {
@@ -377,7 +388,39 @@ func TestHandleUnknownEventNamesTheElement(t *testing.T) {
 
 	out := captureStdout(t, func() { handleUnknownEvent(event, true) })
 
-	if !strings.Contains(out, "nowSelectionUpdated") {
+	if !strings.Contains(out, "someFutureUpdated") {
 		t.Errorf("unknown-event output does not name the element:\n%s", out)
+	}
+}
+
+// TestHandleNowSelectionEventPrintsTheSelection: the frame that used to print
+// as "Unmodelled element" now names what the speaker selected.
+func TestHandleNowSelectionEventPrintsTheSelection(t *testing.T) {
+	// Captured from a SoundTouch 10 when a STORED_MUSIC folder is selected.
+	raw := []byte(`<updates deviceID="DEVICEID01"><nowSelectionUpdated>` +
+		`<preset id="0"><ContentItem source="STORED_MUSIC" type="dir" location="4:cont2:615:part12:39"` +
+		` isPresetable="true"><itemName>A Folder</itemName></ContentItem></preset>` +
+		`</nowSelectionUpdated></updates>`)
+
+	event, err := models.ParseWebSocketEvent(raw)
+	if err != nil {
+		t.Fatalf("ParseWebSocketEvent: %v", err)
+	}
+
+	if len(event.UnknownEventNames()) != 0 {
+		t.Errorf("still reported as unmodelled: %v", event.UnknownEventNames())
+	}
+
+	out := captureStdout(t, func() { handleNowSelectionEvent(event.NowSelectionUpdated, true) })
+
+	for _, want := range []string{"DEVICEID01", "A Folder", "STORED_MUSIC", "4:cont2:615:part12:39"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("now-selection output does not contain %q:\n%s", want, out)
+		}
+	}
+
+	// Preset id 0 means "not a stored preset", so no slot should be claimed.
+	if strings.Contains(out, "Preset:") {
+		t.Errorf("output claims a preset slot for id 0:\n%s", out)
 	}
 }

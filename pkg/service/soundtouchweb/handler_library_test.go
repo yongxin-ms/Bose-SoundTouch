@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,25 +15,51 @@ import (
 	"github.com/gesellix/bose-soundtouch/pkg/service/soundtouchweb/webtypes"
 )
 
-// cannedNavigateResponse is a minimal XML navigateResponse the fake speaker
-// returns for /navigate in browse tests. It contains one directory and one
-// track so we can assert both are mapped correctly.
+// cannedNavigateResponse is an XML navigateResponse the fake speaker returns
+// for /navigate in browse tests: one directory and one track, so we can assert
+// both are mapped correctly.
+//
+// The shape is taken from real captures (issue 700) rather than written by
+// hand, because the hand-written version disagreed with hardware on four
+// counts and the wrong one was load-bearing: it claimed isPresetable="false"
+// on the directory, which was the only reason to doubt that saving a folder to
+// a preset works at all. Captured from a SoundTouch 10 (FW 27.0.6) against two
+// independent media servers, which agreed on all of it:
+//
+//   - directories report Playable="1", not "0"
+//   - isPresetable is "true" on directories and tracks alike
+//   - the ContentItem carries NO type attribute; the kind is the <type>
+//     element on the item
+//   - every item carries a <mediaItemContainer> whose ContentItem repeats the
+//     parent container, so each item has two ContentItems
+//
+// Names and identifiers are placeholders; the structure is verbatim.
 // Note: totalItems is an XML element, not an attribute, per models.NavigateResponse.
 const cannedNavigateResponse = `<?xml version="1.0" encoding="UTF-8" ?>
 <navigateResponse source="STORED_MUSIC" sourceAccount="uuid:test-udn/0">
   <totalItems>2</totalItems>
   <items>
-    <item Playable="0">
+    <item Playable="1">
       <name>Albums</name>
       <type>dir</type>
-      <ContentItem source="STORED_MUSIC" type="dir" location="4:cont2:150:0:0:" sourceAccount="uuid:test-udn/0" isPresetable="false">
+      <mediaItemContainer offset="0">
+        <ContentItem source="STORED_MUSIC" location="0" sourceAccount="uuid:test-udn/0" isPresetable="true">
+          <itemName>uuid:test-udn/0</itemName>
+        </ContentItem>
+      </mediaItemContainer>
+      <ContentItem source="STORED_MUSIC" location="4:cont2:150:0:0:" sourceAccount="uuid:test-udn/0" isPresetable="true">
         <itemName>Albums</itemName>
       </ContentItem>
     </item>
     <item Playable="1">
       <name>Great Song</name>
       <type>track</type>
-      <ContentItem source="STORED_MUSIC" type="track" location="5:audio5:part13:3171:5 TRACK" sourceAccount="uuid:test-udn/0" isPresetable="true">
+      <mediaItemContainer offset="1">
+        <ContentItem source="STORED_MUSIC" location="4:cont2:150:0:0:" sourceAccount="uuid:test-udn/0" isPresetable="true">
+          <itemName>Albums</itemName>
+        </ContentItem>
+      </mediaItemContainer>
+      <ContentItem source="STORED_MUSIC" location="5:audio5:part13:3171:5 TRACK" sourceAccount="uuid:test-udn/0" isPresetable="true">
         <itemName>Great Song</itemName>
       </ContentItem>
     </item>
@@ -300,10 +327,20 @@ func TestHandleLibraryBrowse_RootMapsEntries(t *testing.T) {
 		t.Error("dir.IsDir should be true")
 	}
 
-	if dir.Playable {
-		t.Error("dir.Playable should be false")
+	// Hardware reports Playable="1" on directories: the speaker will happily
+	// play a whole folder, which is what makes a folder preset work.
+	if !dir.Playable {
+		t.Error("dir.Playable should be true, as hardware reports Playable=1 for directories")
 	}
 
+	// Dropped before issue 700, so the UI could not tell whether a folder was
+	// savable to a preset.
+	if !dir.IsPresetable {
+		t.Error("dir.IsPresetable should be true")
+	}
+
+	// The item's own ContentItem, not the parent repeated inside
+	// mediaItemContainer (location "0" here).
 	if dir.Location != "4:cont2:150:0:0:" {
 		t.Errorf("dir location: expected '4:cont2:150:0:0:', got %q", dir.Location)
 	}
@@ -846,5 +883,227 @@ func TestDiscoverDeviceMediaServers_UnreachableSpeakerSkippedSilently(t *testing
 
 	if normalizeUDN(got[0].ID) != "fa095ecc-uuid" {
 		t.Errorf("expected the reachable speaker's server, got %+v", got[0])
+	}
+}
+
+// TestHandleLibraryBrowse_PageSize checks the two halves of the paging
+// contract (issue 583): the default page size the handler asks the speaker
+// for, and that an explicit start and count are passed through so the player
+// can fetch the next slice.
+func TestHandleLibraryBrowse_PageSize(t *testing.T) {
+	tests := []struct {
+		name      string
+		query     string
+		wantStart string
+		wantNum   string
+	}{
+		{"defaults", "account=uuid:test-udn/0", "<startItem>1</startItem>", "<numItems>500</numItems>"},
+		{"explicit page", "account=uuid:test-udn/0&start=501&count=250", "<startItem>501</startItem>", "<numItems>250</numItems>"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			speaker, captured := setupSpeakerMock(t, map[string]string{"/navigate": cannedNavigateResponse})
+			defer speaker.Close()
+
+			app := newLibraryTestApp(speaker.URL)
+
+			req := httptest.NewRequest("GET", "/api/control/devices/lib-device/library/browse?"+tt.query, nil)
+			req = withChiParams(req, map[string]string{"id": "lib-device"})
+			w := httptest.NewRecorder()
+
+			app.HandleLibraryBrowse(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+
+			navigateXML := captured["/navigate"]
+			for _, want := range []string{tt.wantStart, tt.wantNum} {
+				if !strings.Contains(navigateXML, want) {
+					t.Errorf("navigate XML should contain %q, got:\n%s", want, navigateXML)
+				}
+			}
+		})
+	}
+}
+
+// TestHandleLibraryBrowse_ReportsTotalItems pins the field the player pages
+// against: without it there is no way to know a page is partial.
+func TestHandleLibraryBrowse_ReportsTotalItems(t *testing.T) {
+	speaker, _ := setupSpeakerMock(t, map[string]string{"/navigate": cannedNavigateResponse})
+	defer speaker.Close()
+
+	app := newLibraryTestApp(speaker.URL)
+
+	req := httptest.NewRequest("GET", "/api/control/devices/lib-device/library/browse?account=uuid:test-udn/0", nil)
+	req = withChiParams(req, map[string]string{"id": "lib-device"})
+	w := httptest.NewRecorder()
+
+	app.HandleLibraryBrowse(w, req)
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			TotalItems int `json:"totalItems"`
+			Entries    []struct {
+				Name string `json:"name"`
+			} `json:"entries"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if !resp.Success || resp.Data.TotalItems != 2 || len(resp.Data.Entries) != 2 {
+		t.Errorf("got success=%v totalItems=%d entries=%d, want true/2/2",
+			resp.Success, resp.Data.TotalItems, len(resp.Data.Entries))
+	}
+}
+
+// cannedSourcesWithoutLibrary is the same speaker answering with no
+// STORED_MUSIC source at all, which is what issue 580 reports: the media
+// server disappears from one speaker while others still see it.
+const cannedSourcesWithoutLibrary = `<?xml version="1.0" encoding="UTF-8" ?>
+<sources deviceID="AABBCCDDEEFF">
+  <sourceItem source="BLUETOOTH" sourceAccount="" status="READY" isLocal="true" multiroomallowed="false">Bluetooth</sourceItem>
+</sources>`
+
+// TestHandleRefreshLibraryServers_NudgesThenReads verifies the order the
+// refresh depends on: the speaker is told its sources changed, and only then
+// asked what it has. Reading first would report the stale list the user is
+// already looking at.
+func TestHandleRefreshLibraryServers_NudgesThenReads(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+
+	speaker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, r.URL.Path)
+		mu.Unlock()
+
+		if r.URL.Path == "/sources" {
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(cannedSourcesResponse))
+
+			return
+		}
+
+		// /notification answers with the posted status echoed back.
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8" ?><status>/notification</status>`))
+	}))
+	defer speaker.Close()
+
+	app := newLibraryTestApp(speaker.URL)
+
+	req := httptest.NewRequest("POST", "/api/control/devices/lib-device/library/servers/refresh", nil)
+	req = withChiParams(req, map[string]string{"id": "lib-device"})
+	w := httptest.NewRecorder()
+
+	app.HandleRefreshLibraryServers(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Refreshed bool `json:"refreshed"`
+			Servers   []struct {
+				UDN   string `json:"udn"`
+				Name  string `json:"name"`
+				Ready bool   `json:"ready"`
+			} `json:"servers"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if !resp.Success || !resp.Data.Refreshed {
+		t.Errorf("got success=%v refreshed=%v, want both true", resp.Success, resp.Data.Refreshed)
+	}
+
+	if len(resp.Data.Servers) != 1 || resp.Data.Servers[0].UDN != "uuid:nas-udn" || !resp.Data.Servers[0].Ready {
+		t.Errorf("servers = %+v, want the one READY STORED_MUSIC source", resp.Data.Servers)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	notifyAt, sourcesAt := -1, -1
+
+	for i, p := range calls {
+		if p == "/notification" && notifyAt < 0 {
+			notifyAt = i
+		}
+
+		if p == "/sources" && sourcesAt < 0 {
+			sourcesAt = i
+		}
+	}
+
+	if notifyAt < 0 || sourcesAt < 0 || notifyAt > sourcesAt {
+		t.Errorf("calls = %v, want /notification before /sources", calls)
+	}
+}
+
+// TestHandleRefreshLibraryServers_ReportsAnEmptyList covers the case the
+// reporter of issue 580 sees: the speaker genuinely has no media server left.
+// The refresh must answer with an empty list rather than an error, so the UI
+// can say so and point at "Find servers".
+func TestHandleRefreshLibraryServers_ReportsAnEmptyList(t *testing.T) {
+	speaker, _ := setupSpeakerMock(t, map[string]string{"/sources": cannedSourcesWithoutLibrary})
+	defer speaker.Close()
+
+	app := newLibraryTestApp(speaker.URL)
+
+	req := httptest.NewRequest("POST", "/api/control/devices/lib-device/library/servers/refresh", nil)
+	req = withChiParams(req, map[string]string{"id": "lib-device"})
+	w := httptest.NewRecorder()
+
+	app.HandleRefreshLibraryServers(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			Servers []any `json:"servers"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+
+	if !resp.Success || len(resp.Data.Servers) != 0 {
+		t.Errorf("got success=%v servers=%v, want true and an empty list", resp.Success, resp.Data.Servers)
+	}
+}
+
+// TestHandleRefreshLibraryServers_UnknownDevice keeps the 404 distinct from an
+// empty list: "no such speaker" and "this speaker has no media server" are
+// different answers.
+func TestHandleRefreshLibraryServers_UnknownDevice(t *testing.T) {
+	speaker, _ := setupSpeakerMock(t, nil)
+	defer speaker.Close()
+
+	app := newLibraryTestApp(speaker.URL)
+
+	req := httptest.NewRequest("POST", "/api/control/devices/nope/library/servers/refresh", nil)
+	req = withChiParams(req, map[string]string{"id": "nope"})
+	w := httptest.NewRecorder()
+
+	app.HandleRefreshLibraryServers(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
 	}
 }

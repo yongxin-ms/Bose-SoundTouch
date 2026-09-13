@@ -1,11 +1,17 @@
 import { h } from 'preact';
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useRef } from 'preact/hooks';
 import htm from 'htm';
 import { api } from '../api.js';
+import { PresetPicker } from './PresetPicker.js';
 
 const html = htm.bind(h);
 
-export function Library({ devices }) {
+export function Library({
+    devices,
+    onPlaybackRequest,
+    playbackBusy = false,
+    commandReadbackDelays,
+}) {
     const deviceEntries = Object.entries(devices);
     const firstDeviceId = deviceEntries.length > 0 ? deviceEntries[0][0] : null;
 
@@ -15,9 +21,19 @@ export function Library({ devices }) {
     const [server, setServer] = useState(null);       // { udn, name, account }
     const [navStack, setNavStack] = useState([]);     // [{ label, location, type }]
     const [entries, setEntries] = useState([]);
+    // What the speaker says the open container holds, which is how we know a
+    // page is partial. It answers /navigate with totalItems regardless of how
+    // many items the page carries (measured: a 484-entry folder reports 484
+    // whether 200, 400 or all 484 come back).
+    const [totalItems, setTotalItems] = useState(0);
+    const [loadingMore, setLoadingMore] = useState(false);
+    // Fences a page against a browse that started after it: navigating away
+    // while a page is in flight must not append that page to the new folder.
+    const browseGeneration = useRef(0);
     const [loading, setLoading] = useState(false);
     const [finding, setFinding] = useState(false);
-    const [playingName, setPlayingName] = useState(null);
+    const [refreshing, setRefreshing] = useState(false);
+    const [refreshNote, setRefreshNote] = useState('');
 
     // Sync deviceId when devices prop first arrives or changes enough to
     // invalidate the current selection.
@@ -61,6 +77,41 @@ export function Library({ devices }) {
         if (resp.success) setServers(resp.data || []);
     }
 
+    // A registered media server sometimes disappears from one speaker's source
+    // list while other speakers still see it, and a reboot brings it back
+    // (issue 580). This asks the speaker to re-read its accounts and then
+    // reports what it has, which is the same nudge that makes a newly added
+    // server appear without a power cycle.
+    async function refreshServers() {
+        if (!deviceId || refreshing) return;
+
+        setRefreshing(true);
+        setRefreshNote('');
+
+        const before = servers.length;
+        const resp = await api.libraryRefreshServers(deviceId);
+
+        setRefreshing(false);
+
+        if (!resp?.success) {
+            setRefreshNote(resp?.error || 'Refresh failed');
+            return;
+        }
+
+        const found = resp.data?.servers || [];
+        setServers(found);
+
+        // Say what happened either way: a refresh that changes nothing looks
+        // identical to one that did not run.
+        if (found.length > before) {
+            setRefreshNote(`Found ${found.length} server${found.length === 1 ? '' : 's'}`);
+        } else if (found.length === 0) {
+            setRefreshNote('The speaker reports no media server. Use "Find servers" to add one again.');
+        } else {
+            setRefreshNote('No change');
+        }
+    }
+
     async function discover() {
         setLoading(true);
         const resp = await api.libraryDiscover(6);
@@ -93,10 +144,52 @@ export function Library({ devices }) {
     }
 
     async function browseLevel(account, location, type) {
+        const generation = ++browseGeneration.current;
+
         setLoading(true);
+        setEntries([]);
+        setTotalItems(0);
+
         const resp = await api.libraryBrowse(deviceId, { account, location, type });
+
+        if (generation !== browseGeneration.current) return;
+
         setLoading(false);
-        if (resp.success) setEntries(resp.data?.entries || []);
+        if (!resp.success) return;
+
+        setEntries(resp.data?.entries || []);
+        setTotalItems(resp.data?.totalItems || 0);
+    }
+
+    // The speaker pages: a large folder comes back in slices, and the rest is
+    // only fetched when asked for. Before this, the first page was all anyone
+    // ever saw, so a 393-entry folder looked like it held 200 (issue 583).
+    async function loadMore() {
+        const generation = browseGeneration.current;
+        const frame = navStack[navStack.length - 1];
+
+        if (!server || !frame || loadingMore) return;
+
+        setLoadingMore(true);
+
+        const resp = await api.libraryBrowse(deviceId, {
+            account: server.account,
+            location: frame.location,
+            type: frame.type,
+            start: entries.length + 1,
+        });
+
+        if (generation !== browseGeneration.current) return;
+
+        setLoadingMore(false);
+        if (!resp.success) return;
+
+        const page = resp.data?.entries || [];
+
+        // A page that comes back empty would otherwise leave the button
+        // offering a next page forever, so trust the page over the count.
+        setTotalItems(page.length === 0 ? entries.length : (resp.data?.totalItems || 0));
+        setEntries(current => [...current, ...page]);
     }
 
     async function browseEntry(entry) {
@@ -112,18 +205,66 @@ export function Library({ devices }) {
         await browseLevel(server.account, frame.location, frame.type);
     }
 
-    async function playEntry(entry) {
+    function playEntry(entry) {
         // Pass the entry's own type so a folder selects as a container ("dir")
         // rather than a single track — that lets the speaker queue the folder so
         // next/previous and auto-advance work, instead of stopping after one item.
-        await api.libraryPlay(deviceId, {
-            account: server.account,
-            location: entry.location,
-            type: entry.type || 'track',
-            name: entry.name,
+        const selectedDeviceId = deviceId;
+        const selectedServer = server;
+        if (!selectedDeviceId || !selectedServer) return;
+        onPlaybackRequest?.({
+            deviceId: selectedDeviceId,
+            action: 'library',
+            readbackDelays: commandReadbackDelays,
+            invoke: () => api.libraryPlayChecked(selectedDeviceId, {
+                account: selectedServer.account,
+                location: entry.location,
+                type: entry.type || 'track',
+                name: entry.name,
+            }),
+            expected: {
+                source: 'STORED_MUSIC',
+                sourceAccount: selectedServer.account,
+                location: entry.location,
+                itemName: entry.name,
+            },
         });
-        setPlayingName(entry.name);
-        setTimeout(() => setPlayingName(null), 3000);
+    }
+
+    // Saving a row to a preset names the content rather than storing whatever
+    // is playing, so nothing has to be interrupted first (issue 700). The
+    // speaker accepts a folder ContentItem with no type attribute at all —
+    // that is how it stores one itself — so the type is sent only for items
+    // that are not containers.
+    function savePresetFor(entry, slot) {
+        const account = server?.account;
+
+        if (!deviceId || !account || !entry?.location) {
+            return Promise.reject(new Error('no device, server or location'));
+        }
+
+        return api.storePresetContent(deviceId, slot, {
+            source: 'STORED_MUSIC',
+            sourceAccount: account,
+            location: entry.location,
+            type: entry.isDir ? '' : (entry.type || 'track'),
+            itemName: entry.name,
+        }).then(res => {
+            if (!res?.success) throw new Error(res?.error || 'preset save failed');
+        });
+    }
+
+    // The slot this row already occupies, if any, so the star can say so.
+    const presetList = devices[deviceId]?.status?.presets?.Preset ?? [];
+
+    function mappedSlotFor(entry) {
+        const match = entry?.location
+            ? presetList.find(p =>
+                p.ContentItem?.Source === 'STORED_MUSIC' &&
+                p.ContentItem?.Location === entry.location)
+            : undefined;
+
+        return match ? match.ID : null;
     }
 
     function toggleFinding() {
@@ -164,9 +305,17 @@ export function Library({ devices }) {
                     >
                         ${finding ? 'Hide' : 'Find servers'}
                     </button>
-                    <span style="font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--text-dim);padding:.2rem .4rem;border:1px solid var(--border);border-radius:4px">
-                        BETA
-                    </span>
+                    <button
+                        class="btn-secondary"
+                        onClick=${refreshServers}
+                        disabled=${refreshing}
+                        title="Ask the speaker to re-read its media servers"
+                    >
+                        ${refreshing ? 'Refreshing…' : 'Refresh'}
+                    </button>
+                    ${refreshNote ? html`
+                        <span class="library-refresh-note tunein-item-desc">${refreshNote}</span>
+                    ` : null}
                 </div>
             `}
 
@@ -232,6 +381,7 @@ export function Library({ devices }) {
                             </li>
                         `)}
                     </ul>
+
                 </div>
             ` : null}
 
@@ -247,12 +397,6 @@ export function Library({ devices }) {
                                 }
                             `)}
                         </nav>
-                    ` : null}
-
-                    ${playingName ? html`
-                        <div style="font-size:.875rem;color:var(--text-dim);margin-bottom:.5rem">
-                            Playing: <strong>${playingName}</strong>
-                        </div>
                     ` : null}
 
                     ${entries.length === 0 && !loading ? html`
@@ -275,13 +419,35 @@ export function Library({ devices }) {
                                     <button
                                         class="tunein-play-btn"
                                         title="${entry.isDir ? 'Play folder' : 'Play'} on ${devices[deviceId]?.info?.name || deviceId}"
+                                        disabled=${playbackBusy}
                                         onClick=${(e) => { e.stopPropagation(); playEntry(entry); }}
                                     >▶</button>
+                                    <${PresetPicker}
+                                        onSave=${slot => savePresetFor(entry, slot)}
+                                        mappedSlot=${mappedSlotFor(entry)}
+                                        label=${entry.isDir ? 'Save folder as preset' : 'Save as preset'}
+                                        wrapClass="library-preset-wrap"
+                                        buttonClass="library-preset-btn"
+                                        overlayClass="preset-picker-overlay"
+                                    />
                                 ` : null}
                                 ${entry.isDir ? html`<span class="tunein-item-arrow">›</span>` : null}
                             </li>
                         `)}
                     </ul>
+
+                    ${entries.length > 0 && entries.length < totalItems ? html`
+                        <div class="library-more">
+                            <button
+                                class="btn-secondary"
+                                onClick=${loadMore}
+                                disabled=${loadingMore}
+                            >${loadingMore ? 'Loading…' : 'Load more'}</button>
+                            <span class="tunein-item-desc">
+                                ${entries.length} of ${totalItems}
+                            </span>
+                        </div>
+                    ` : null}
                 </div>
             ` : null}
 

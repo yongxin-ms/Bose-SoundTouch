@@ -36,7 +36,7 @@ package main
 import (
     "fmt"
     "log"
-    
+
     "github.com/gesellix/bose-soundtouch/pkg/client"
 )
 
@@ -47,7 +47,7 @@ func main() {
         Port: 8090,
     }
     soundtouch := client.NewClient(config)
-    
+
     // Your navigation code here...
 }
 ```
@@ -99,6 +99,45 @@ if err != nil {
     fmt.Printf("Music library: %d dirs, %d tracks\n", len(directories), len(tracks))
 }
 ```
+
+### What a navigate item actually contains
+
+Measured on a SoundTouch 10 (FW 27.0.6) against two independent media servers,
+a FRITZ!Box UPnP server and this repository's `cmd/example-dlna-server`. Both
+agreed, and three details matter to anyone parsing this by hand:
+
+- **Every item carries two ContentItems.** The one inside
+  `<mediaItemContainer>` is the *parent container* and repeats identically on
+  every item of the page; the item's own is the sibling that follows it.
+  `models.NavigateItem` keeps them apart, so read `item.ContentItem` and not
+  the container's.
+- **Directories report `Playable="1"` and `isPresetable="true"`.** The speaker
+  will play a whole folder, and will store one as a preset. Note that
+  `models.ContentItem.IsPresetable` is a plain bool, so an absent attribute and
+  an explicit `false` arrive identically: treat `false` on a playable directory
+  as "unknown" rather than "no".
+- **The item's ContentItem has no `type` attribute.** The kind is the `<type>`
+  element on the item (`dir`, `track`). Anything reconstructing a ContentItem
+  for `/select` has to supply the type itself.
+
+- **No artwork, anywhere.** Neither the item nor its ContentItem carries a
+  `containerArt`, on any of the servers measured. The cover you see while a
+  library track plays comes from the speaker resolving the media server's own
+  metadata at play time, which is why a folder saved to a preset straight from
+  a navigate result has no art unless the caller supplies it.
+
+Location tokens are opaque and server-specific (`4:cont1:20:0:0:` on one
+server, `1` on another) and index-dependent, so they can break when the media
+server reindexes.
+
+They are, however, the media server's own DLNA object IDs: a container's
+location is its object ID verbatim, and a playable item's is the object ID plus
+a ` TRACK` suffix. Measured on MiniDLNA (album `1$6$7$2`, track
+`1$6$7$2$5 TRACK`) and a FRITZ!Box (container `4:cont2:150:0:0:`, track
+`5:audio5:part13:3171:5 TRACK`). That is what lets AfterTouch ask the media
+server directly about an item the speaker named, e.g. for the album art the
+navigate response omits (`pkg/dlna.Metadata`, a ContentDirectory
+`BrowseMetadata` call).
 
 ### Navigate Into Directories
 
@@ -160,21 +199,21 @@ for {
     if err != nil {
         log.Fatal(err)
     }
-    
+
     if len(response.Items) == 0 {
         break // No more items
     }
-    
+
     fmt.Printf("Page starting at %d: %d items\n", startItem, len(response.Items))
-    
+
     // Process this page
     for _, item := range response.Items {
         fmt.Printf("  %s (%s)\n", item.GetDisplayName(), item.Type)
     }
-    
+
     // Move to next page
     startItem += pageSize
-    
+
     // Stop if we've seen all items
     if startItem > response.TotalItems {
         break
@@ -245,7 +284,7 @@ if err != nil {
 // Analyze all results
 for _, result := range results.GetAllResults() {
     fmt.Printf("Name: %s, Token: %s\n", result.GetDisplayName(), result.Token)
-    
+
     // Determine result type
     switch {
     case result.IsSong():
@@ -314,10 +353,10 @@ for i, station := range stations.Items {
 // Remove a specific station (example: remove the first one)
 if len(stations.Items) > 0 {
     stationToRemove := stations.Items[0]
-    
+
     if stationToRemove.ContentItem != nil {
         fmt.Printf("Removing: %s\n", stationToRemove.GetDisplayName())
-        
+
         err := soundtouch.RemoveStation(stationToRemove.ContentItem)
         if err != nil {
             log.Printf("Failed to remove station: %v", err)
@@ -349,17 +388,17 @@ if err != nil {
 artists := searchResults.GetArtists()
 for i, artist := range artists[:min(3, len(artists))] {
     stationName := fmt.Sprintf("%s Radio", artist.Name)
-    
+
     fmt.Printf("Adding station %d: %s\n", i+1, stationName)
-    
+
     err := soundtouch.AddStation("PANDORA", "your_account", artist.Token, stationName)
     if err != nil {
         log.Printf("Failed to add %s: %v", stationName, err)
         continue
     }
-    
+
     fmt.Printf("✓ Added: %s\n", stationName)
-    
+
     // Note: Each AddStation immediately starts playing that station
     // You might want to pause between additions in a real app
 }
@@ -374,25 +413,25 @@ fmt.Println("Station collection updated!")
 ```go
 func discoverAndPlayWorkflow(soundtouch *client.Client) {
     fmt.Println("=== Discover and Play Workflow ===")
-    
+
     // Step 1: Search for content
     searchTerm := "electronic music"
     fmt.Printf("🔍 Searching for '%s'...\n", searchTerm)
-    
+
     results, err := soundtouch.SearchTuneInStations(searchTerm)
     if err != nil {
         log.Fatal(err)
     }
-    
+
     if results.IsEmpty() {
         fmt.Println("❌ No results found")
         return
     }
-    
+
     // Step 2: Show options
     stations := results.GetStations()
     fmt.Printf("📻 Found %d stations:\n", len(stations))
-    
+
     for i, station := range stations[:min(5, len(stations))] {
         fmt.Printf("%d. %s", i+1, station.GetDisplayName())
         if station.Description != "" {
@@ -400,12 +439,12 @@ func discoverAndPlayWorkflow(soundtouch *client.Client) {
         }
         fmt.Println()
     }
-    
+
     // Step 3: Select and play (example: select first one)
     if len(stations) > 0 {
         selectedStation := stations[0]
         fmt.Printf("🎵 Playing: %s\n", selectedStation.GetDisplayName())
-        
+
         // For services that support it, add the station to play it
         if selectedStation.Token != "" {
             err := soundtouch.AddStation("TUNEIN", "", selectedStation.Token, selectedStation.Name)
@@ -424,38 +463,38 @@ func discoverAndPlayWorkflow(soundtouch *client.Client) {
 ```go
 func organizeLibraryWorkflow(soundtouch *client.Client, deviceAccount string) {
     fmt.Println("=== Library Organization Workflow ===")
-    
+
     // Step 1: Explore library structure
     fmt.Println("📂 Exploring music library...")
-    
+
     library, err := soundtouch.GetStoredMusicLibrary(deviceAccount)
     if err != nil {
         log.Fatal(err)
     }
-    
+
     directories := library.GetDirectories()
     tracks := library.GetTracks()
-    
-    fmt.Printf("📊 Library overview: %d directories, %d tracks\n", 
+
+    fmt.Printf("📊 Library overview: %d directories, %d tracks\n",
         len(directories), len(tracks))
-    
+
     // Step 2: Navigate into each directory
     for _, dir := range directories[:min(3, len(directories))] {
         fmt.Printf("\n📁 Exploring: %s\n", dir.GetDisplayName())
-        
+
         contents, err := soundtouch.NavigateContainer(
             "STORED_MUSIC", deviceAccount, 1, 20, dir.ContentItem)
         if err != nil {
             log.Printf("❌ Failed to explore %s: %v", dir.GetDisplayName(), err)
             continue
         }
-        
+
         subTracks := contents.GetTracks()
         subDirs := contents.GetDirectories()
-        
-        fmt.Printf("   Contains: %d tracks, %d subdirectories\n", 
+
+        fmt.Printf("   Contains: %d tracks, %d subdirectories\n",
             len(subTracks), len(subDirs))
-        
+
         // Show some tracks
         for i, track := range subTracks[:min(3, len(subTracks))] {
             fmt.Printf("   %d. %s", i+1, track.GetDisplayName())
@@ -465,7 +504,7 @@ func organizeLibraryWorkflow(soundtouch *client.Client, deviceAccount string) {
             fmt.Println()
         }
     }
-    
+
     fmt.Println("\n✓ Library exploration complete!")
 }
 ```
@@ -476,7 +515,7 @@ func organizeLibraryWorkflow(soundtouch *client.Client, deviceAccount string) {
 func multiServiceDiscovery(soundtouch *client.Client, accounts map[string]string) {
     searchTerm := "jazz"
     fmt.Printf("🔍 Searching '%s' across all services...\n", searchTerm)
-    
+
     // Search TuneIn (no account needed)
     fmt.Println("\n📻 TuneIn Results:")
     tuneInResults, err := soundtouch.SearchTuneInStations(searchTerm)
@@ -489,7 +528,7 @@ func multiServiceDiscovery(soundtouch *client.Client, accounts map[string]string
             fmt.Printf("  %d. %s\n", i+1, station.GetDisplayName())
         }
     }
-    
+
     // Search Pandora (if account available)
     if pandoraAccount, ok := accounts["PANDORA"]; ok {
         fmt.Println("\n🎵 Pandora Results:")
@@ -500,13 +539,13 @@ func multiServiceDiscovery(soundtouch *client.Client, accounts map[string]string
             artists := pandoraResults.GetArtists()
             stations := pandoraResults.GetStations()
             fmt.Printf("✓ Found %d artists, %d stations\n", len(artists), len(stations))
-            
+
             for i, artist := range artists[:min(2, len(artists))] {
                 fmt.Printf("  Artist: %s\n", artist.GetDisplayName())
             }
         }
     }
-    
+
     // Search Spotify (if account available)
     if spotifyAccount, ok := accounts["SPOTIFY"]; ok {
         fmt.Println("\n🎼 Spotify Results:")
@@ -516,13 +555,13 @@ func multiServiceDiscovery(soundtouch *client.Client, accounts map[string]string
         } else {
             songs := spotifyResults.GetSongs()
             fmt.Printf("✓ Found %d songs\n", len(songs))
-            
+
             for i, song := range songs[:min(2, len(songs))] {
                 fmt.Printf("  Song: %s\n", song.GetFullTitle())
             }
         }
     }
-    
+
     fmt.Println("\n✓ Multi-service discovery complete!")
 }
 ```
@@ -535,25 +574,25 @@ func multiServiceDiscovery(soundtouch *client.Client, accounts map[string]string
 func robustNavigation(soundtouch *client.Client) error {
     // Try multiple sources gracefully
     sources := []string{"TUNEIN", "SPOTIFY", "STORED_MUSIC"}
-    
+
     for _, source := range sources {
         fmt.Printf("Trying %s...\n", source)
-        
+
         response, err := soundtouch.Navigate(source, "", 1, 10)
         if err != nil {
             fmt.Printf("❌ %s failed: %v\n", source, err)
             continue
         }
-        
+
         if response.IsEmpty() {
             fmt.Printf("⚠️  %s has no content\n", source)
             continue
         }
-        
+
         fmt.Printf("✓ %s available with %d items\n", source, response.TotalItems)
         return nil
     }
-    
+
     return fmt.Errorf("no sources available")
 }
 ```
@@ -563,23 +602,23 @@ func robustNavigation(soundtouch *client.Client) error {
 ```go
 func searchWithRetry(soundtouch *client.Client, maxRetries int) (*models.SearchStationResponse, error) {
     var lastErr error
-    
+
     for attempt := 1; attempt <= maxRetries; attempt++ {
         fmt.Printf("Search attempt %d/%d...\n", attempt, maxRetries)
-        
+
         results, err := soundtouch.SearchTuneInStations("classical")
         if err == nil {
             return results, nil
         }
-        
+
         lastErr = err
         fmt.Printf("❌ Attempt %d failed: %v\n", attempt, err)
-        
+
         if attempt < maxRetries {
             time.Sleep(time.Duration(attempt) * time.Second)
         }
     }
-    
+
     return nil, fmt.Errorf("search failed after %d attempts: %w", maxRetries, lastErr)
 }
 ```
@@ -592,46 +631,46 @@ func safeStationManagement(soundtouch *client.Client, pandoraAccount string) {
     if pandoraAccount == "" {
         log.Fatal("Pandora account required")
     }
-    
+
     // Search safely
     results, err := soundtouch.SearchPandoraStations(pandoraAccount, "blues")
     if err != nil {
         log.Fatal(err)
     }
-    
+
     if results.IsEmpty() {
         fmt.Println("No results found")
         return
     }
-    
+
     // Check what we have before adding stations
     artists := results.GetArtists()
     if len(artists) == 0 {
         fmt.Println("No artists found to create stations from")
         return
     }
-    
+
     // Get current stations to avoid duplicates
     currentStations, err := soundtouch.GetPandoraStations(pandoraAccount)
     if err != nil {
         log.Printf("Warning: Could not get current stations: %v", err)
     }
-    
+
     // Create a map of existing station names
     existingStations := make(map[string]bool)
     for _, station := range currentStations.Items {
         existingStations[station.GetDisplayName()] = true
     }
-    
+
     // Add stations only if they don't exist
     for _, artist := range artists[:min(2, len(artists))] {
         stationName := artist.Name + " Radio"
-        
+
         if existingStations[stationName] {
             fmt.Printf("⚠️  Station already exists: %s\n", stationName)
             continue
         }
-        
+
         fmt.Printf("Adding new station: %s\n", stationName)
         err := soundtouch.AddStation("PANDORA", pandoraAccount, artist.Token, stationName)
         if err != nil {
@@ -671,23 +710,23 @@ const batchSize = 50
 
 func processLargeLibrary(soundtouch *client.Client, sourceAccount string) {
     startItem := 1
-    
+
     for {
         batch, err := soundtouch.Navigate("STORED_MUSIC", sourceAccount, startItem, batchSize)
         if err != nil {
             log.Printf("Error at position %d: %v", startItem, err)
             break
         }
-        
+
         if len(batch.Items) == 0 {
             break // No more items
         }
-        
+
         // Process this batch
         processBatch(batch.Items)
-        
+
         startItem += batchSize
-        
+
         // Prevent infinite loops
         if startItem > batch.TotalItems {
             break
@@ -705,7 +744,7 @@ func handleServiceDifferences(soundtouch *client.Client) {
     if err == nil {
         fmt.Printf("TuneIn: %d stations\n", len(tuneInStations.GetStations()))
     }
-    
+
     // Pandora: Requires user account
     pandoraResults, err := soundtouch.SearchPandoraStations("user_account", "rock")
     if err == nil {
@@ -713,7 +752,7 @@ func handleServiceDifferences(soundtouch *client.Client) {
         artists := pandoraResults.GetArtists()
         fmt.Printf("Pandora: %d artists\n", len(artists))
     }
-    
+
     // Spotify: Requires user account, returns tracks/playlists
     spotifyResults, err := soundtouch.SearchSpotifyContent("spotify_user", "pop")
     if err == nil {
@@ -728,13 +767,13 @@ func handleServiceDifferences(soundtouch *client.Client) {
 ```go
 func userFriendlySearch(soundtouch *client.Client, searchTerm string) {
     fmt.Printf("🔍 Searching for '%s'...\n", searchTerm)
-    
+
     results, err := soundtouch.SearchTuneInStations(searchTerm)
     if err != nil {
         fmt.Printf("❌ Search failed: %v\n", err)
         return
     }
-    
+
     if results.IsEmpty() {
         fmt.Printf("😞 No results found for '%s'\n", searchTerm)
         fmt.Println("💡 Try different search terms like:")
@@ -743,10 +782,10 @@ func userFriendlySearch(soundtouch *client.Client, searchTerm string) {
         fmt.Println("   - Station types: news, talk, music")
         return
     }
-    
+
     stations := results.GetStations()
     fmt.Printf("🎵 Found %d stations:\n", len(stations))
-    
+
     for i, station := range stations {
         fmt.Printf("%d. 📻 %s", i+1, station.GetDisplayName())
         if station.Description != "" {
@@ -766,10 +805,10 @@ func userFriendlySearch(soundtouch *client.Client, searchTerm string) {
 func efficientBrowsing(soundtouch *client.Client) {
     // Use reasonable page sizes
     const optimalPageSize = 25 // Good balance of network efficiency and memory usage
-    
+
     // Cache frequently accessed data
     var cachedSources *models.Sources
-    
+
     getSources := func() (*models.Sources, error) {
         if cachedSources == nil {
             var err error
@@ -778,13 +817,13 @@ func efficientBrowsing(soundtouch *client.Client) {
         }
         return cachedSources, nil
     }
-    
+
     // Use the cached sources
     sources, err := getSources()
     if err != nil {
         return
     }
-    
+
     // Process efficiently
     for _, source := range sources.SourceItem {
         if source.Status.IsReady() {
@@ -799,30 +838,30 @@ func efficientBrowsing(soundtouch *client.Client) {
 
 ### Navigation Methods
 
-| Method | Description | Parameters | Returns |
-|--------|-------------|------------|---------|
-| `Navigate()` | Browse content source | source, account, start, count | NavigateResponse |
-| `NavigateWithMenu()` | Browse with menu/sort | source, account, menu, sort, start, count | NavigateResponse |
-| `NavigateContainer()` | Browse into directory | source, account, start, count, container | NavigateResponse |
-| `GetTuneInStations()` | Convenience for TuneIn | account | NavigateResponse |
-| `GetPandoraStations()` | Convenience for Pandora | account | NavigateResponse |
-| `GetStoredMusicLibrary()` | Convenience for stored music | account | NavigateResponse |
+| Method                    | Description                  | Parameters                                | Returns          |
+|---------------------------|------------------------------|-------------------------------------------|------------------|
+| `Navigate()`              | Browse content source        | source, account, start, count             | NavigateResponse |
+| `NavigateWithMenu()`      | Browse with menu/sort        | source, account, menu, sort, start, count | NavigateResponse |
+| `NavigateContainer()`     | Browse into directory        | source, account, start, count, container  | NavigateResponse |
+| `GetTuneInStations()`     | Convenience for TuneIn       | account                                   | NavigateResponse |
+| `GetPandoraStations()`    | Convenience for Pandora      | account                                   | NavigateResponse |
+| `GetStoredMusicLibrary()` | Convenience for stored music | account                                   | NavigateResponse |
 
 ### Search Methods
 
-| Method | Description | Parameters | Returns |
-|--------|-------------|------------|---------|
-| `SearchStation()` | Generic station search | source, account, term | SearchStationResponse |
-| `SearchTuneInStations()` | Search TuneIn | term | SearchStationResponse |
-| `SearchPandoraStations()` | Search Pandora | account, term | SearchStationResponse |
-| `SearchSpotifyContent()` | Search Spotify | account, term | SearchStationResponse |
+| Method                    | Description            | Parameters            | Returns               |
+|---------------------------|------------------------|-----------------------|-----------------------|
+| `SearchStation()`         | Generic station search | source, account, term | SearchStationResponse |
+| `SearchTuneInStations()`  | Search TuneIn          | term                  | SearchStationResponse |
+| `SearchPandoraStations()` | Search Pandora         | account, term         | SearchStationResponse |
+| `SearchSpotifyContent()`  | Search Spotify         | account, term         | SearchStationResponse |
 
 ### Station Management Methods
 
-| Method | Description | Parameters | Returns |
-|--------|-------------|------------|---------|
-| `AddStation()` | Add station (plays immediately) | source, account, token, name | error |
-| `RemoveStation()` | Remove station from collection | contentItem | error |
+| Method            | Description                     | Parameters                   | Returns |
+|-------------------|---------------------------------|------------------------------|---------|
+| `AddStation()`    | Add station (plays immediately) | source, account, token, name | error   |
+| `RemoveStation()` | Remove station from collection  | contentItem                  | error   |
 
 ### Response Helper Methods
 
@@ -830,7 +869,7 @@ func efficientBrowsing(soundtouch *client.Client) {
 
 - `GetPlayableItems()` - Filter playable items
 - `GetDirectories()` - Filter directories
-- `GetTracks()` - Filter music tracks  
+- `GetTracks()` - Filter music tracks
 - `GetStations()` - Filter radio stations
 - `IsEmpty()` - Check if response has no items
 
@@ -855,14 +894,14 @@ func efficientBrowsing(soundtouch *client.Client) {
 
 ### Common Source Types
 
-| Source | Description | Account Required | Search Support |
-|--------|-------------|------------------|----------------|
-| `TUNEIN` | Internet radio stations | No | Yes |
-| `PANDORA` | Pandora music service | Yes | Yes |
-| `SPOTIFY` | Spotify music service | Yes | Yes |
-| `STORED_MUSIC` | Local/network music | Device account | No |
-| `BLUETOOTH` | Bluetooth audio input | No | No |
-| `AUX` | Auxiliary input | No | No |
+| Source         | Description             | Account Required | Search Support |
+|----------------|-------------------------|------------------|----------------|
+| `TUNEIN`       | Internet radio stations | No               | Yes            |
+| `PANDORA`      | Pandora music service   | Yes              | Yes            |
+| `SPOTIFY`      | Spotify music service   | Yes              | Yes            |
+| `STORED_MUSIC` | Local/network music     | Device account   | No             |
+| `BLUETOOTH`    | Bluetooth audio input   | No               | No             |
+| `AUX`          | Auxiliary input         | No               | No             |
 
 ## Troubleshooting
 
@@ -878,7 +917,7 @@ func efficientBrowsing(soundtouch *client.Client) {
 - Check if the service is working (try via SoundTouch app)
 - Verify account has access to content
 
-**"AddStation failed"** 
+**"AddStation failed"**
 - Ensure the token is valid (from search results)
 - Check that the service supports adding stations
 - Verify account permissions

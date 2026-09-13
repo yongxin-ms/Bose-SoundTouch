@@ -1,5 +1,5 @@
 import { h, render } from 'preact';
-import { useState, useEffect, useCallback } from 'preact/hooks';
+import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
 import htm from 'htm';
 import { DeviceList } from './components/DeviceList.js';
 import { NowPlaying } from './components/NowPlaying.js';
@@ -15,9 +15,16 @@ import { Library } from './components/Library.js';
 import { PlayURL } from './components/PlayURL.js';
 import { TTS } from './components/TTS.js';
 import { Announcements } from './components/Announcements.js';
+import { ContentPlaybackCommand } from './components/ContentPlaybackCommand.js';
 import { api } from './api.js';
 import { isSoundTouch10StereoPair } from './stereoPresentation.mjs';
 import { removeDeviceAndRefresh } from './deviceRemoval.js';
+import {
+    DISCRETE_COMMAND_READBACK_DELAYS_MS,
+    contentExpectation,
+    trackSkipExpectation,
+    useDiscreteCommand,
+} from './discreteCommand.js';
 
 const html = htm.bind(h);
 
@@ -98,8 +105,128 @@ export function mergeStatusUpdate(previous, deviceId, status) {
     });
 }
 
-function DeviceDetail({ deviceId, devices, onBack, onDevicesChanged, notify, onRemove, onStatusReadback, onNavigate }) {
+export function DeviceDetail({
+    deviceId,
+    devices,
+    onBack,
+    onDevicesChanged,
+    notify,
+    onRemove,
+    onStatusReadback,
+    onNavigate,
+    commandReadbackDelays = DISCRETE_COMMAND_READBACK_DELAYS_MS,
+}) {
     const device = devices[deviceId];
+    const status = device?.status;
+    const {
+        command,
+        busy: commandBusy,
+        statusText: commandStatus,
+        run: runDiscreteCommand,
+    } = useDiscreteCommand({
+        deviceId,
+        status,
+        onStatusReadback,
+        readbackDelays: commandReadbackDelays,
+    });
+    const source = status?.nowPlaying?.Source;
+    const playStatus = status?.nowPlaying?.PlayStatus;
+
+    // A speaker that is offline, or that has not been polled yet, reports no
+    // state to predict an outcome from. Reconciling such a command is
+    // impossible, but disabling the control is worse: that is exactly the
+    // speaker you want to power cycle or prod. These fall back to the
+    // behaviour from before reconciliation -- send the key, report nothing --
+    // rather than going dead.
+    function togglePower() {
+        if (!source) {
+            api.power(deviceId);
+            return;
+        }
+        runDiscreteCommand(source === 'STANDBY' ? 'power-on' : 'power-off',
+            () => api.powerChecked(deviceId));
+    }
+
+    function togglePlayback() {
+        if (!playStatus) {
+            api.key(deviceId, 'PLAY');
+            return;
+        }
+        const isPlaying = playStatus === 'PLAY_STATE';
+        runDiscreteCommand(isPlaying ? 'pause' : 'play',
+            () => api.keyChecked(deviceId, isPlaying ? 'PAUSE' : 'PLAY'));
+    }
+
+    function toggleMute() {
+        const muted = status?.volume?.MuteEnabled;
+        if (typeof muted !== 'boolean') {
+            api.key(deviceId, 'MUTE');
+            return;
+        }
+        runDiscreteCommand(muted ? 'mute-off' : 'mute-on',
+            () => api.keyChecked(deviceId, 'MUTE'));
+    }
+
+    function toggleShuffle() {
+        const shuffle = status?.nowPlaying?.ShuffleSetting;
+        if (!shuffle) {
+            api.key(deviceId, 'SHUFFLE_ON');
+            return;
+        }
+        const target = shuffle === 'SHUFFLE_ON' ? 'SHUFFLE_OFF' : 'SHUFFLE_ON';
+        runDiscreteCommand(target === 'SHUFFLE_ON' ? 'shuffle-on' : 'shuffle-off',
+            () => api.keyChecked(deviceId, target));
+    }
+
+    function cycleRepeat() {
+        const repeat = status?.nowPlaying?.RepeatSetting;
+        if (!repeat) {
+            api.key(deviceId, 'REPEAT_OFF');
+            return;
+        }
+        const target = repeat === 'REPEAT_OFF' ? 'REPEAT_ALL'
+            : repeat === 'REPEAT_ALL' ? 'REPEAT_ONE' : 'REPEAT_OFF';
+        runDiscreteCommand(`repeat-${target.substring('REPEAT_'.length).toLowerCase()}`,
+            () => api.keyChecked(deviceId, target));
+    }
+
+    function previousTrack() {
+        runDiscreteCommand('previous-track',
+            () => api.keyChecked(deviceId, 'PREV_TRACK'),
+            trackSkipExpectation(status?.nowPlaying,
+                Boolean(status?.nowPlaying?.SkipPreviousEnabled)));
+    }
+
+    function nextTrack() {
+        runDiscreteCommand('next-track',
+            () => api.keyChecked(deviceId, 'NEXT_TRACK'),
+            trackSkipExpectation(status?.nowPlaying,
+                Boolean(status?.nowPlaying?.SkipEnabled)));
+    }
+
+    function selectPreset(preset) {
+        if (!preset?.ContentItem) return;
+        runDiscreteCommand('preset',
+            () => api.controlChecked(deviceId, 'preset', preset.ID),
+            { ...contentExpectation(preset.ContentItem), targetId: String(preset.ID) });
+    }
+
+    function playRecent(item) {
+        const content = item?.ContentItem;
+        if (!content?.Location) return;
+        runDiscreteCommand('recent', () => api.playChecked(deviceId, {
+            source: content.Source,
+            type: content.Type,
+            location: content.Location,
+            sourceAccount: content.SourceAccount,
+            itemName: content.ItemName,
+            containerArt: content.ContainerArt,
+            isPresetable: content.IsPresetable,
+        }), {
+            ...contentExpectation(content),
+            targetId: String(item.ID || item.UTCTime || content.Location),
+        });
+    }
 
     if (!device) {
         return html`
@@ -114,7 +241,13 @@ function DeviceDetail({ deviceId, devices, onBack, onDevicesChanged, notify, onR
         <div class="device-detail">
             <div class="page-header">
                 <button class="back-btn" onClick=${onBack}>← Back</button>
-                <button class="btn-icon" onClick=${() => api.power(deviceId)} title="Power">
+                <button
+                    class="btn-icon command-btn ${command?.action?.startsWith('power-') ? command.outcome : ''}"
+                    onClick=${togglePower}
+                    title="Power"
+                    disabled=${commandBusy}
+                    aria-busy=${command?.action?.startsWith('power-') && commandBusy ? 'true' : null}
+                >
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
                         <path d="M12 2v8" />
                         <path d="M18.36 6.64a9 9 0 1 1-12.73 0" />
@@ -122,8 +255,26 @@ function DeviceDetail({ deviceId, devices, onBack, onDevicesChanged, notify, onR
                 </button>
             </div>
             <${NowPlaying} nowPlaying=${device.status?.nowPlaying} deviceId=${deviceId} presets=${device.status?.presets} />
-            <${Controls} deviceId=${deviceId} status=${device.status} />
-            <${Presets} deviceId=${deviceId} status=${device.status} />
+            <${Controls}
+                deviceId=${deviceId}
+                status=${device.status}
+                command=${command}
+                commandBusy=${commandBusy}
+                commandStatus=${commandStatus}
+                onTogglePlayback=${togglePlayback}
+                onToggleMute=${toggleMute}
+                onToggleShuffle=${toggleShuffle}
+                onCycleRepeat=${cycleRepeat}
+                onPreviousTrack=${previousTrack}
+                onNextTrack=${nextTrack}
+            />
+            <${Presets}
+                deviceId=${deviceId}
+                status=${device.status}
+                command=${command}
+                commandBusy=${commandBusy}
+                onSelect=${selectPreset}
+            />
             <${Sources}
                 deviceId=${deviceId}
                 status=${device.status}
@@ -144,7 +295,13 @@ function DeviceDetail({ deviceId, devices, onBack, onDevicesChanged, notify, onR
                 </aside>
             ` : null}
             <${Zone} deviceId=${deviceId} devices=${devices} />
-            <${Recents} deviceId=${deviceId} />
+            <${Recents}
+                deviceId=${deviceId}
+                presets=${device.status?.presets}
+                command=${command}
+                commandBusy=${commandBusy}
+                onPlay=${playRecent}
+            />
             ${!device.stereoPair ? html`
                 <div class="device-management-section">
                     <div class="section-title">Device management</div>
@@ -179,6 +336,9 @@ function App() {
     // 'connecting' until the first frame arrives, so a page opened while the
     // service is down does not claim the connection was lost.
     const [connection, setConnection] = useState('connecting');
+    const [contentPlaybackRequest, setContentPlaybackRequest] = useState(null);
+    const [contentPlaybackBusy, setContentPlaybackBusy] = useState(false);
+    const contentPlaybackRef = useRef({ generation: 0, busy: false });
 
     const getPageTitle = () => {
         if (page === 'devices') return 'Devices';
@@ -314,8 +474,43 @@ function App() {
         setDevices(previous => mergeDevicesSnapshot(previous, resp.data));
     }
 
-    function mergeDeviceReadback(deviceId, status) {
-        setDevices(previous => mergeStatusUpdate(previous, deviceId, status));
+    function mergeDeviceReadback(deviceId, status, readbackInfo = null) {
+        setDevices(previous => {
+            if (readbackInfo?.device_id &&
+                previous[deviceId]?.info?.device_id !== readbackInfo.device_id) {
+                return previous;
+            }
+            return mergeStatusUpdate(previous, deviceId, status);
+        });
+    }
+
+    function startContentPlayback(request) {
+        if (contentPlaybackRef.current.busy) return false;
+        const targetIdentity = devices[request.deviceId]?.info?.device_id;
+        if (!targetIdentity) {
+            showToast('Playback target is no longer available');
+            return false;
+        }
+
+        contentPlaybackRef.current.busy = true;
+        contentPlaybackRef.current.generation += 1;
+        setContentPlaybackBusy(true);
+        setContentPlaybackRequest({
+            ...request,
+            key: `content-playback-${contentPlaybackRef.current.generation}`,
+            targetIdentity,
+        });
+        return true;
+    }
+
+    function updateContentPlaybackState(state) {
+        contentPlaybackRef.current.busy = state.busy;
+        setContentPlaybackBusy(state.busy);
+    }
+
+    function clearContentPlayback() {
+        if (contentPlaybackRef.current.busy) return;
+        setContentPlaybackRequest(null);
     }
 
     async function removeDevice(id) {
@@ -400,6 +595,16 @@ function App() {
             <${Announcements} />
 
             <main class="main-content">
+                ${contentPlaybackRequest ? html`
+                    <${ContentPlaybackCommand}
+                        key=${contentPlaybackRequest.key}
+                        request=${contentPlaybackRequest}
+                        devices=${devices}
+                        onStatusReadback=${mergeDeviceReadback}
+                        onStateChange=${updateContentPlaybackState}
+                        onClear=${clearContentPlayback}
+                    />
+                ` : null}
                 ${page === 'devices' ? html`
                     <${DeviceList}
                         key="device-list"
@@ -421,15 +626,36 @@ function App() {
                         onNavigate=${navigate}
                     />
                 ` : page === 'tunein' ? html`
-                    <${TuneInBrowser} key="tunein-browser" devices=${devices} />
+                    <${TuneInBrowser}
+                        key="tunein-browser"
+                        devices=${devices}
+                        onPlaybackRequest=${startContentPlayback}
+                        playbackBusy=${contentPlaybackBusy}
+                    />
                 ` : page === 'radiobrowser' ? html`
-                    <${RadioBrowser} key="radiobrowser-browser" devices=${devices} />
+                    <${RadioBrowser}
+                        key="radiobrowser-browser"
+                        devices=${devices}
+                        onPlaybackRequest=${startContentPlayback}
+                        playbackBusy=${contentPlaybackBusy}
+                    />
                 ` : page === 'playurl' ? html`
-                    <${PlayURL} key="play-url" devices=${devices} serverServiceUrl=${version?.service_url || ''} />
+                    <${PlayURL}
+                        key="play-url"
+                        devices=${devices}
+                        serverServiceUrl=${version?.service_url || ''}
+                        onPlaybackRequest=${startContentPlayback}
+                        playbackBusy=${contentPlaybackBusy}
+                    />
                 ` : page === 'tts' ? html`
                     <${TTS} key="tts" devices=${devices} serverServiceUrl=${version?.service_url || ''} />
                 ` : page === 'library' ? html`
-                    <${Library} key="library" devices=${devices} />
+                    <${Library}
+                        key="library"
+                        devices=${devices}
+                        onPlaybackRequest=${startContentPlayback}
+                        playbackBusy=${contentPlaybackBusy}
+                    />
                 ` : null}
             </main>
 

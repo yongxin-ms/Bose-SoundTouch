@@ -78,7 +78,19 @@ function balanceLabel(level) {
     return level < 0 ? `L${-level}` : `R${level}`;
 }
 
-export function Controls({ deviceId, status }) {
+export function Controls({
+    deviceId,
+    status,
+    command,
+    commandBusy = false,
+    commandStatus = '',
+    onTogglePlayback,
+    onToggleMute,
+    onToggleShuffle,
+    onCycleRepeat,
+    onPreviousTrack,
+    onNextTrack,
+}) {
     const np = status?.nowPlaying;
     const isPlaying = np?.PlayStatus === 'PLAY_STATE';
     const actualVolume = status?.volume?.ActualVolume ?? 0;
@@ -106,6 +118,13 @@ export function Controls({ deviceId, status }) {
     useEffect(() => { setLocalBalance(actualBalance); }, [actualBalance]);
 
     const send = (key) => api.key(deviceId, key);
+    const transportCommand = command?.action === 'play' || command?.action === 'pause'
+        ? command : null;
+    const muteCommand = command?.action?.startsWith('mute-') ? command : null;
+    const shuffleCommand = command?.action?.startsWith('shuffle-') ? command : null;
+    const repeatCommand = command?.action?.startsWith('repeat-') ? command : null;
+    const previousCommand = command?.action === 'previous-track' ? command : null;
+    const nextCommand = command?.action === 'next-track' ? command : null;
 
     // One throttle per slider per mount. The local state still updates on every
     // input, so the handle keeps up with the pointer; only the network write is
@@ -135,42 +154,79 @@ export function Controls({ deviceId, status }) {
         writeBalance(deviceId, val);
     }
 
-    function toggleShuffle() {
-        send(shuffle === 'SHUFFLE_ON' ? 'SHUFFLE_OFF' : 'SHUFFLE_ON');
-    }
-
-    function cycleRepeat() {
-        if (repeat === 'REPEAT_OFF') send('REPEAT_ALL');
-        else if (repeat === 'REPEAT_ALL') send('REPEAT_ONE');
-        else send('REPEAT_OFF');
-    }
-
     return html`
         <div class="controls">
             <div class="transport">
-                <button class="ctrl-btn" onClick=${() => send('PREV_TRACK')} title="Previous" aria-label="Previous">
+                <button
+                    class="ctrl-btn command-btn previous-btn ${previousCommand?.outcome || ''}"
+                    onClick=${onPreviousTrack || (() => send('PREV_TRACK'))}
+                    disabled=${commandBusy}
+                    aria-busy=${previousCommand && commandBusy ? 'true' : null}
+                    title=${previousCommand && commandBusy ? commandStatus : 'Previous'}
+                    aria-label="Previous"
+                >
                     ${IconPrev()}
                 </button>
                 <button
-                    class="ctrl-btn play-btn"
-                    onClick=${() => send(isPlaying ? 'PAUSE' : 'PLAY')}
-                    title=${isPlaying ? 'Pause' : 'Play'}
+                    class="ctrl-btn play-btn command-btn ${transportCommand?.outcome || ''}"
+                    onClick=${onTogglePlayback || (() => send(isPlaying ? 'PAUSE' : 'PLAY'))}
+                    disabled=${commandBusy}
+                    aria-busy=${transportCommand && commandBusy ? 'true' : null}
+                    title=${transportCommand && commandBusy ? commandStatus : (isPlaying ? 'Pause' : 'Play')}
                     aria-label=${isPlaying ? 'Pause' : 'Play'}
                 >
                     ${isPlaying ? IconPause() : IconPlay()}
                 </button>
-                <button class="ctrl-btn" onClick=${() => send('NEXT_TRACK')} title="Next" aria-label="Next">
+                <button
+                    class="ctrl-btn command-btn next-btn ${nextCommand?.outcome || ''}"
+                    onClick=${onNextTrack || (() => send('NEXT_TRACK'))}
+                    disabled=${commandBusy}
+                    aria-busy=${nextCommand && commandBusy ? 'true' : null}
+                    title=${nextCommand && commandBusy ? commandStatus : 'Next'}
+                    aria-label="Next"
+                >
                     ${IconNext()}
                 </button>
-                <button class="ctrl-btn ${isMuted ? 'active' : ''}" onClick=${() => send('MUTE')} title="Mute" aria-label="Mute" aria-pressed=${isMuted}>
+                <button
+                    class="ctrl-btn command-btn mute-btn ${isMuted ? 'active' : ''} ${muteCommand?.outcome || ''}"
+                    onClick=${onToggleMute || (() => send('MUTE'))}
+                    disabled=${commandBusy}
+                    aria-busy=${muteCommand && commandBusy ? 'true' : null}
+                    title=${muteCommand && commandBusy ? commandStatus : (isMuted ? 'Unmute' : 'Mute')}
+                    aria-label=${isMuted ? 'Unmute' : 'Mute'}
+                    aria-pressed=${isMuted}
+                >
                     ${IconVolume({ muted: isMuted })}
                 </button>
-                <button class="ctrl-btn ${shuffle === 'SHUFFLE_ON' ? 'active' : ''}" onClick=${toggleShuffle} title="Shuffle" aria-label="Shuffle" aria-pressed=${shuffle === 'SHUFFLE_ON'}>
+                <button
+                    class="ctrl-btn command-btn shuffle-btn ${shuffle === 'SHUFFLE_ON' ? 'active' : ''} ${shuffleCommand?.outcome || ''}"
+                    onClick=${onToggleShuffle || (() => send(shuffle === 'SHUFFLE_ON' ? 'SHUFFLE_OFF' : 'SHUFFLE_ON'))}
+                    disabled=${commandBusy}
+                    aria-busy=${shuffleCommand && commandBusy ? 'true' : null}
+                    title=${shuffleCommand && commandBusy ? commandStatus : 'Shuffle'}
+                    aria-label="Shuffle"
+                    aria-pressed=${shuffle === 'SHUFFLE_ON'}
+                >
                     ${IconShuffle()}
                 </button>
-                <button class="ctrl-btn ${repeat !== 'REPEAT_OFF' ? 'active' : ''}" onClick=${cycleRepeat} title=${repeat === 'REPEAT_ONE' ? 'Repeat one' : repeat === 'REPEAT_ALL' ? 'Repeat all' : 'Repeat'} aria-label=${repeat === 'REPEAT_ONE' ? 'Repeat one' : repeat === 'REPEAT_ALL' ? 'Repeat all' : 'Repeat'} aria-pressed=${repeat !== 'REPEAT_OFF'}>
+                <button
+                    class="ctrl-btn command-btn repeat-btn ${repeat !== 'REPEAT_OFF' ? 'active' : ''} ${repeatCommand?.outcome || ''}"
+                    onClick=${onCycleRepeat || (() => {
+                        if (repeat === 'REPEAT_OFF') send('REPEAT_ALL');
+                        else if (repeat === 'REPEAT_ALL') send('REPEAT_ONE');
+                        else send('REPEAT_OFF');
+                    })}
+                    disabled=${commandBusy}
+                    aria-busy=${repeatCommand && commandBusy ? 'true' : null}
+                    title=${repeatCommand && commandBusy ? commandStatus : (repeat === 'REPEAT_ONE' ? 'Repeat one' : repeat === 'REPEAT_ALL' ? 'Repeat all' : 'Repeat')}
+                    aria-label=${repeat === 'REPEAT_ONE' ? 'Repeat one' : repeat === 'REPEAT_ALL' ? 'Repeat all' : 'Repeat'}
+                    aria-pressed=${repeat !== 'REPEAT_OFF'}
+                >
                     ${IconRepeat({ one: repeat === 'REPEAT_ONE' })}
                 </button>
+            </div>
+            <div class="discrete-command-status" role="status" aria-live="polite">
+                ${commandStatus}
             </div>
             <div class="volume-row">
                 <span class="volume-icon">${IconVolume({ size: 16 })}</span>
