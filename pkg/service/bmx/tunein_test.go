@@ -721,3 +721,86 @@ func TestTuneInClassifyItemMarksUnrecognizedTypesInsteadOfDroppingThem(t *testin
 		}
 	})
 }
+
+func TestSaveTuneInEndpointsRestoresBasesAndAllowlist(t *testing.T) {
+	restore := SaveTuneInEndpoints()
+
+	SetTuneInEndpoints("http://127.0.0.1:1", "http://127.0.0.2:1")
+
+	if tuneInAPIBase != "http://127.0.0.2:1" || !allowedTuneInHosts["127.0.0.1"] {
+		t.Fatalf("override did not apply: api=%q hosts=%v", tuneInAPIBase, allowedTuneInHosts)
+	}
+
+	restore()
+
+	if tuneInOpmlTuneBase != "http://opml.radiotime.com" || tuneInOpmlDescribeBase != "https://opml.radiotime.com" ||
+		tuneInOpmlNavigateBase != "http://opml.radiotime.com" || tuneInAPIBase != "https://api.radiotime.com" {
+		t.Errorf("bases not restored: tune=%q describe=%q navigate=%q api=%q",
+			tuneInOpmlTuneBase, tuneInOpmlDescribeBase, tuneInOpmlNavigateBase, tuneInAPIBase)
+	}
+
+	if len(allowedTuneInHosts) != 2 || allowedTuneInHosts["127.0.0.1"] || allowedTuneInHosts["127.0.0.2"] {
+		t.Errorf("allowlist not restored: %v", allowedTuneInHosts)
+	}
+}
+
+func TestParseTuneInDescribe(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		wantName string
+		wantLogo string
+		wantOK   bool
+	}{
+		{
+			// Trimmed from a live describe.ashx?id=s1217 response.
+			name: "station logo in a child element",
+			body: `<?xml version="1.0" encoding="UTF-8"?><opml version="1"><head><status>200</status></head><body>` +
+				`<outline type="object" text="RMF FM"><station><guide_id>s1217</guide_id><name>RMF FM</name>` +
+				`<logo>https://cdn-profiles.tunein.com/s1217/images/logoq.png?t=637969312540000000</logo></station></outline></body></opml>`,
+			wantName: "RMF FM",
+			wantLogo: "https://cdn-profiles.tunein.com/s1217/images/logoq.png?t=637969312540000000",
+			wantOK:   true,
+		},
+		{
+			// Trimmed from a live describe.ashx?id=p17 response.
+			name: "program logo in a child element",
+			body: `<opml version="1"><body><outline type="object" text="Fresh Air"><program>` +
+				`<logo>https://cdn-profiles.tunein.com/p17/images/logoq.png</logo></program></outline></body></opml>`,
+			wantName: "Fresh Air",
+			wantLogo: "https://cdn-profiles.tunein.com/p17/images/logoq.png",
+			wantOK:   true,
+		},
+		{
+			name:     "outline image attribute",
+			body:     `<opml version="1"><body><outline type="object" text="Attr Radio" image="http://example.com/a.png"/></body></opml>`,
+			wantName: "Attr Radio",
+			wantLogo: "http://example.com/a.png",
+			wantOK:   true,
+		},
+		{
+			name:     "name only in the child element",
+			body:     `<opml version="1"><body><outline type="object"><station><name>Child Name</name></station></outline></body></opml>`,
+			wantName: "Child Name",
+			wantOK:   true,
+		},
+		{
+			name: "no outline",
+			body: `<opml version="1"><head><status>400</status></head><body></body></opml>`,
+		},
+		{
+			name: "not XML",
+			body: `#STATUS: 400`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			name, logo, ok := parseTuneInDescribe([]byte(tc.body))
+			if ok != tc.wantOK || name != tc.wantName || logo != tc.wantLogo {
+				t.Errorf("parseTuneInDescribe() = (%q, %q, %v), want (%q, %q, %v)",
+					name, logo, ok, tc.wantName, tc.wantLogo, tc.wantOK)
+			}
+		})
+	}
+}
