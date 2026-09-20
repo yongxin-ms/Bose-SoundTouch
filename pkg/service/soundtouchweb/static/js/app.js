@@ -16,8 +16,11 @@ import { PlayURL } from './components/PlayURL.js';
 import { TTS } from './components/TTS.js';
 import { Announcements } from './components/Announcements.js';
 import { ContentPlaybackCommand } from './components/ContentPlaybackCommand.js';
+import { Settings } from './components/Settings.js';
+import { deviceSettingsTarget } from './settingsPresentation.mjs';
 import { api } from './api.js';
 import { isSoundTouch10StereoPair } from './stereoPresentation.mjs';
+import { previousDetailTarget } from './devicePresentation.js';
 import { removeDeviceAndRefresh } from './deviceRemoval.js';
 import {
     DISCRETE_COMMAND_READBACK_DELAYS_MS,
@@ -110,6 +113,7 @@ export function DeviceDetail({
     devices,
     onBack,
     onDevicesChanged,
+    onSelectZoneMember,
     notify,
     onRemove,
     onStatusReadback,
@@ -227,7 +231,6 @@ export function DeviceDetail({
             targetId: String(item.ID || item.UTCTime || content.Location),
         });
     }
-
     if (!device) {
         return html`
             <div class="page-header">
@@ -236,6 +239,8 @@ export function DeviceDetail({
             <p>Device not found.</p>
         `;
     }
+
+    const settingsTarget = deviceSettingsTarget(deviceId, device);
 
     return html`
         <div class="device-detail">
@@ -294,7 +299,11 @@ export function DeviceDetail({
                     <span>SoundTouch 10 speakers cannot use AirPlay while paired. Unpair them to use AirPlay.</span>
                 </aside>
             ` : null}
-            <${Zone} deviceId=${deviceId} devices=${devices} />
+            <${Zone}
+                deviceId=${deviceId}
+                devices=${devices}
+                onSelectMember=${onSelectZoneMember}
+            />
             <${Recents}
                 deviceId=${deviceId}
                 presets=${device.status?.presets}
@@ -302,6 +311,15 @@ export function DeviceDetail({
                 commandBusy=${commandBusy}
                 onPlay=${playRecent}
             />
+            ${settingsTarget ? html`
+                <${Settings}
+                    key=${`settings:${settingsTarget.controlId}:${settingsTarget.physicalId}`}
+                    deviceId=${settingsTarget.controlId}
+                    targetIdentity=${settingsTarget.physicalId}
+                    targetName=${settingsTarget.name}
+                    targetRole=${settingsTarget.role}
+                />
+            ` : null}
             ${!device.stereoPair ? html`
                 <div class="device-management-section">
                     <div class="section-title">Device management</div>
@@ -330,6 +348,9 @@ function App() {
     const [devices, setDevices] = useState({});
     const [page, setPage] = useState('devices');
     const [selectedId, setSelectedId] = useState(null);
+    // Device-detail pages opened from a zone's member rows, most recent
+    // last, so Back retraces them instead of dropping to the device list.
+    const [detailOrigins, setDetailOrigins] = useState([]);
     const [toast, setToast] = useState(null);
     const [version, setVersion] = useState(null);
     const [isDiscovering, setIsDiscovering] = useState(false);
@@ -457,9 +478,32 @@ function App() {
     }
 
     const navigate = useCallback((p, id = null) => {
+        setDetailOrigins([]);
         setPage(p);
         setSelectedId(id);
     }, []);
+
+    function openZoneMember(controlId) {
+        // A zone member is an ordinary inventory entry, so open its live
+        // entry; the row of the page already open is not a navigation.
+        if (!controlId || controlId === selectedId || !devices[controlId]) return;
+
+        setDetailOrigins(origins => [...origins, selectedId]);
+        setSelectedId(controlId);
+        setPage('device');
+    }
+
+    function backFromDevice() {
+        const { id, origins } = previousDetailTarget(detailOrigins, devices);
+        if (!id) {
+            navigate('devices');
+            return;
+        }
+
+        setDetailOrigins(origins);
+        setSelectedId(id);
+        setPage('device');
+    }
 
     async function discover() {
         showToast('Discovering devices…');
@@ -615,11 +659,12 @@ function App() {
                     />
                 ` : page === 'device' ? html`
                     <${DeviceDetail}
-                        key="device-detail"
+                        key=${`device-detail:${selectedId}`}
                         deviceId=${selectedId}
                         devices=${devices}
-                        onBack=${() => navigate('devices')}
+                        onBack=${backFromDevice}
                         onDevicesChanged=${refreshDevices}
+                        onSelectZoneMember=${openZoneMember}
                         notify=${showToast}
                         onRemove=${removeDevice}
                         onStatusReadback=${mergeDeviceReadback}

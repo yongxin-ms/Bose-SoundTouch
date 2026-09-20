@@ -4,7 +4,12 @@ import test from 'node:test';
 import {
     connectivityLabel,
     connectivityState,
+    nowPlayingFreshness,
+    previousDetailTarget,
+    currentZoneMember,
+    resolvedZoneMember,
     sortDeviceEntries,
+    zoneMemberControlID,
 } from '../static/js/devicePresentation.js';
 
 test('uses tri-state connectivity before the compatibility flag', () => {
@@ -64,4 +69,59 @@ test('uses stable control-ID tie breaks for equal names and addresses', () => {
         'speaker-a',
         'speaker-b',
     ]);
+});
+
+test('resolves stale zone-detail identities from the current projection', () => {
+    const initial = {
+        controlId: '192.0.2.20',
+        name: 'Living left',
+        deviceIds: ['left-id', 'right-id'],
+    };
+    const current = {
+        controlId: 'living.local',
+        name: 'Living',
+        deviceIds: ['left-id', 'right-id'],
+        connectivity: 'online',
+    };
+
+    assert.equal(currentZoneMember({ members: [current] }, initial), current);
+    assert.deepEqual(resolvedZoneMember({ members: [current] }, initial), {
+        member: current,
+        controlId: 'living.local',
+        name: 'Living',
+    });
+    assert.equal(zoneMemberControlID({ ip: '192.0.2.99' }), '192.0.2.99');
+});
+
+test('now playing is presented as live only while the speaker is online', () => {
+    assert.deepEqual(nowPlayingFreshness({ status: { connectivity: 'online' } }), {
+        live: true,
+        label: '',
+        title: '',
+    });
+
+    const stale = nowPlayingFreshness({ status: { connectivity: 'stale', isConnected: true } });
+    assert.equal(stale.live, false);
+    assert.equal(stale.label, 'Last known');
+    assert.match(stale.title, /missed an update/);
+
+    const offline = nowPlayingFreshness({ status: { isConnected: false } });
+    assert.equal(offline.live, false);
+    assert.match(offline.title, /went offline/);
+});
+
+test('back from a zone member retraces the pages that are still in the inventory', () => {
+    const devices = { master: {}, member: {} };
+
+    assert.deepEqual(previousDetailTarget(['master', 'member'], devices), {
+        id: 'member',
+        origins: ['master'],
+    });
+    assert.deepEqual(previousDetailTarget(['master', 'gone'], devices), {
+        id: 'master',
+        origins: [],
+    });
+    assert.deepEqual(previousDetailTarget(['gone'], devices), { id: null, origins: [] });
+    assert.deepEqual(previousDetailTarget([], devices), { id: null, origins: [] });
+    assert.deepEqual(previousDetailTarget(['__proto__'], {}), { id: null, origins: [] });
 });

@@ -51,7 +51,7 @@ type GenerationRef struct {
 type GenerationCleanup func(GenerationRef) error
 
 // GenerationPreflight verifies that no persisted group record remains for
-// speakers whose fresh physical state is standalone. It must be read-only and
+// speakers whose fresh physical group state is empty. It must be read-only and
 // fail closed; exact generation retirement is a separate operation.
 type GenerationPreflight func([]GenerationRef) error
 
@@ -221,6 +221,7 @@ type memberState struct {
 	result          MemberResult
 	client          Client
 	info            *models.DeviceInfo
+	zone            *models.ZoneInfo
 	group           *models.Group
 	mutationGroupID string
 	mutationGroup   *models.Group
@@ -410,8 +411,14 @@ func (c *Coordinator) Create(req CreateRequest) (Result, error) {
 	captureVerifiedGenerationIDs(states, expected)
 
 	if pairVerified(states) {
-		result.Status = StatusSucceeded
 		result.Group = cloneGroup(states[0].group)
+		if !c.settleCreatedPairZones(states) {
+			result.Status = StatusDegraded
+
+			return finish(result, states)
+		}
+
+		result.Status = StatusSucceeded
 
 		return finish(result, states)
 	}
@@ -433,6 +440,7 @@ func (c *Coordinator) prepareCreate(req CreateRequest, states []memberState, res
 	}
 
 	validateCreateCandidates(states)
+	validateCreateZones(states)
 
 	if hasPreflightError(states) {
 		return nil
@@ -440,7 +448,7 @@ func (c *Coordinator) prepareCreate(req CreateRequest, states []memberState, res
 
 	if c.generationPreflight != nil {
 		result.PersistenceAttempted = true
-		if err := c.generationPreflight(standaloneGenerationRefs(states)); err != nil {
+		if err := c.generationPreflight(createCandidateGenerationRefs(states)); err != nil {
 			result.PersistenceError = wrapUnavailable("check persisted group generations", err)
 			setPreflightError(&states[0], result.PersistenceError)
 
@@ -451,6 +459,7 @@ func (c *Coordinator) prepareCreate(req CreateRequest, states []memberState, res
 
 		c.revalidateCreateCandidates(states)
 		validateCreateCandidates(states)
+		validateCreateZones(states)
 
 		if hasPreflightError(states) {
 			return nil
@@ -492,6 +501,131 @@ func validateCreateCandidates(states []memberState) {
 	if !SameMargeBackend(states[0].info.MargeURL, states[1].info.MargeURL) {
 		setPreflightError(&states[1], fmt.Errorf("%w: LEFT and RIGHT speakers must use the same Marge backend", ErrConflict))
 	}
+}
+
+type createZoneTopology struct {
+	master  string
+	devices map[string]struct{}
+}
+
+func validateCreateZones(states []memberState) {
+	if len(states) != 2 || states[0].info == nil || states[1].info == nil {
+		return
+	}
+
+	topologies := make([]createZoneTopology, len(states))
+
+	standalone := make([]bool, len(states))
+	for i := range states {
+		var err error
+
+		topologies[i], standalone[i], err = parseCreateZone(states[i].zone, states[i].info.DeviceID)
+		if err != nil {
+			setPreflightError(&states[i], fmt.Errorf("%w: invalid zone view: %w", ErrConflict, err))
+		}
+	}
+
+	if hasPreflightError(states) {
+		return
+	}
+
+	if standalone[0] && standalone[1] {
+		return
+	}
+
+	if standalone[0] != standalone[1] {
+		err := fmt.Errorf("%w: LEFT and RIGHT speakers disagree about temporary zone membership", ErrConflict)
+		setPreflightError(&states[0], err)
+		setPreflightError(&states[1], err)
+
+		return
+	}
+
+	if !sameCreateZone(topologies[0], topologies[1]) {
+		err := fmt.Errorf("%w: LEFT and RIGHT speakers report different temporary zones", ErrConflict)
+		setPreflightError(&states[0], err)
+		setPreflightError(&states[1], err)
+
+		return
+	}
+
+	for i := range states {
+		if _, ok := topologies[0].devices[states[i].info.DeviceID]; !ok {
+			err := fmt.Errorf("%w: temporary zone does not contain both stereo-pair candidates", ErrConflict)
+			setPreflightError(&states[0], err)
+			setPreflightError(&states[1], err)
+
+			return
+		}
+	}
+
+	// Only a zone of exactly the two candidates is known to transition
+	// cleanly. A third speaker (as master or member) is never contacted or
+	// re-read here, so a reference it keeps after the transition would go
+	// unnoticed; fail closed until that shape has been tried on hardware.
+	if len(topologies[0].devices) != len(states) {
+		err := fmt.Errorf("%w: temporary zone contains speakers other than the stereo-pair candidates", ErrConflict)
+		setPreflightError(&states[0], err)
+		setPreflightError(&states[1], err)
+	}
+}
+
+// parseCreateZone reads one speaker's zone view. It is the single definition
+// of "standalone" for create, rename and dissolve: an empty zone, or a zone
+// that lists only the speaker itself as master.
+func parseCreateZone(zone *models.ZoneInfo, deviceID string) (createZoneTopology, bool, error) {
+	topology := createZoneTopology{}
+	if zone == nil {
+		return topology, false, errors.New("zone response is nil")
+	}
+
+	if zone.Master == "" && len(zone.Members) == 0 {
+		return topology, true, nil
+	}
+
+	topology.master = strings.TrimSpace(zone.Master)
+	if topology.master == "" {
+		return topology, false, errors.New("zone master is empty")
+	}
+
+	topology.devices = map[string]struct{}{topology.master: {}}
+
+	listed := make(map[string]struct{}, len(zone.Members))
+	for i := range zone.Members {
+		memberID := strings.TrimSpace(zone.Members[i].DeviceID)
+		if memberID == "" {
+			return createZoneTopology{}, false, errors.New("zone member device ID is empty")
+		}
+
+		if _, duplicate := listed[memberID]; duplicate {
+			return createZoneTopology{}, false, fmt.Errorf("zone repeats member %q", memberID)
+		}
+
+		listed[memberID] = struct{}{}
+		topology.devices[memberID] = struct{}{}
+	}
+
+	if _, ok := topology.devices[deviceID]; !ok {
+		return createZoneTopology{}, false, errors.New("zone view does not contain the physical speaker")
+	}
+
+	standalone := len(topology.devices) == 1 && topology.master == deviceID
+
+	return topology, standalone, nil
+}
+
+func sameCreateZone(left, right createZoneTopology) bool {
+	if left.master != right.master || len(left.devices) != len(right.devices) {
+		return false
+	}
+
+	for deviceID := range left.devices {
+		if _, ok := right.devices[deviceID]; !ok {
+			return false
+		}
+	}
+
+	return true
 }
 
 func (c *Coordinator) revalidateCreateCandidates(states []memberState) {
@@ -931,19 +1065,61 @@ func verifyCompensation(states []memberState) {
 		states[i].result.CompensationVerified = false
 		states[i].compensationVerificationError = nil
 
-		group, err := states[i].client.GetGroup()
+		group, groupErr := states[i].client.GetGroup()
 		states[i].group = group
 		states[i].result.Group = cloneGroup(group)
 
-		switch {
-		case err != nil:
-			states[i].compensationVerificationError = wrapUnavailable("verify compensation", err)
-		case group == nil || !group.IsEmpty():
-			states[i].compensationVerificationError = errors.New("compensation did not leave an empty group")
-		default:
+		var verificationErrors []error
+		if groupErr != nil {
+			verificationErrors = append(verificationErrors, wrapUnavailable("verify compensation group", groupErr))
+		} else if group == nil || !group.IsEmpty() {
+			verificationErrors = append(verificationErrors, errors.New("compensation did not leave an empty group"))
+		}
+
+		zone, zoneErr := states[i].client.GetZone()
+		if zoneErr != nil {
+			verificationErrors = append(verificationErrors, wrapUnavailable("verify compensation zone", zoneErr))
+		} else if err := verifyCompensationZone(states[i].zone, zone, states[i].result.DeviceID); err != nil {
+			verificationErrors = append(verificationErrors, err)
+		}
+
+		if len(verificationErrors) == 0 {
 			states[i].result.CompensationVerified = true
+		} else {
+			states[i].compensationVerificationError = errors.Join(verificationErrors...)
 		}
 	}
+}
+
+func verifyCompensationZone(expected, actual *models.ZoneInfo, deviceID string) error {
+	expectedTopology, expectedStandalone, err := parseCreateZone(expected, deviceID)
+	if err != nil {
+		return fmt.Errorf("invalid pre-compensation zone: %w", err)
+	}
+
+	actualTopology, actualStandalone, err := parseCreateZone(actual, deviceID)
+	if err != nil {
+		return fmt.Errorf("invalid zone after compensation: %w", err)
+	}
+
+	// Standalone is the clean end state of a rollback. In the same-zone flow
+	// the firmware dissolves the temporary zone while forming the pair, and
+	// compensation only removes the group; it never recreates that zone, so
+	// requiring it back would fail every same-zone rollback and, with it,
+	// the generation cleanup that is gated on compensation.
+	if actualStandalone {
+		return nil
+	}
+
+	if expectedStandalone {
+		return errors.New("speaker joined a zone during compensation")
+	}
+
+	if !sameCreateZone(expectedTopology, actualTopology) {
+		return errors.New("compensation did not restore the pre-pairing zone topology")
+	}
+
+	return nil
 }
 
 func compensationVerified(states []memberState) bool {
@@ -1051,7 +1227,7 @@ func generationRefForState(state *memberState, groupID string) GenerationRef {
 	return ref
 }
 
-func standaloneGenerationRefs(states []memberState) []GenerationRef {
+func createCandidateGenerationRefs(states []memberState) []GenerationRef {
 	refs := make([]GenerationRef, 0, len(states))
 	for i := range states {
 		refs = append(refs, generationRefForState(&states[i], ""))
@@ -1114,10 +1290,12 @@ func (c *Coordinator) preflightCreate(state *memberState) {
 		return
 	}
 
-	if zone == nil || !zone.IsStandalone() {
-		state.result.PreflightError = fmt.Errorf("%w: speaker is currently in a zone", ErrConflict)
+	if zone == nil {
+		state.result.PreflightError = wrapUnavailable("get zone", errors.New("nil response"))
 		return
 	}
+
+	state.zone = cloneZone(zone)
 
 	state.group, err = client.GetGroup()
 	if err != nil {
@@ -1140,7 +1318,22 @@ func (c *Coordinator) preflightStandaloneZone(state *memberState) {
 	state.result.Reachable = true
 	if zone == nil {
 		setPreflightError(state, wrapUnavailable("get zone", errors.New("nil response")))
-	} else if !zone.IsStandalone() {
+
+		return
+	}
+
+	// Use the same reading of a zone view as create, so a pair that create
+	// accepts is also one that rename and dissolve accept.
+	deviceID := ""
+	if state.info != nil {
+		deviceID = state.info.DeviceID
+	}
+
+	_, standalone, err := parseCreateZone(zone, deviceID)
+	switch {
+	case err != nil:
+		setPreflightError(state, fmt.Errorf("%w: invalid zone view: %w", ErrConflict, err))
+	case !standalone:
 		setPreflightError(state, fmt.Errorf("%w: speaker is currently in a zone", ErrConflict))
 	}
 }
@@ -1352,6 +1545,60 @@ func verifyPair(states []memberState, verify func(*models.Group) error) {
 	}
 }
 
+// settleCreatedPairZones verifies that both members left any temporary zone.
+// A zone view that lags behind a zone-to-stereo transition, or a single failed
+// read, is expected right after the mutation, so the check is repeated
+// through the same settle delays as every other verification here before a
+// verified pair is reported as degraded.
+func (c *Coordinator) settleCreatedPairZones(states []memberState) bool {
+	if verifyCreatedPairZones(states) {
+		return true
+	}
+
+	for _, delay := range c.uncertainOutcomeDelays {
+		time.Sleep(delay)
+
+		if verifyCreatedPairZones(states) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func verifyCreatedPairZones(states []memberState) bool {
+	verified := true
+
+	for i := range states {
+		states[i].result.VerificationError = nil
+
+		zone, err := states[i].client.GetZone()
+
+		states[i].zone = cloneZone(zone)
+		if err != nil {
+			states[i].result.VerificationError = fmt.Errorf("get zone after verified group mutation: %w", err)
+			verified = false
+
+			continue
+		}
+
+		_, standalone, err := parseCreateZone(zone, states[i].result.DeviceID)
+		if err != nil {
+			states[i].result.VerificationError = fmt.Errorf("verify zone after group mutation: %w", err)
+			verified = false
+
+			continue
+		}
+
+		if !standalone {
+			states[i].result.VerificationError = errors.New("verify zone after group mutation: speaker remains in a temporary zone")
+			verified = false
+		}
+	}
+
+	return verified
+}
+
 func hasUncertainMutationOutcome(states []memberState) bool {
 	for i := range states {
 		if isUncertainMutationOutcome(states[i].result.MutationError) {
@@ -1530,6 +1777,17 @@ func cloneGroup(group *models.Group) *models.Group {
 
 	clone := *group
 	clone.Roles.Roles = append([]models.GroupRole(nil), group.Roles.Roles...)
+
+	return &clone
+}
+
+func cloneZone(zone *models.ZoneInfo) *models.ZoneInfo {
+	if zone == nil {
+		return nil
+	}
+
+	clone := *zone
+	clone.Members = append([]models.Member(nil), zone.Members...)
 
 	return &clone
 }

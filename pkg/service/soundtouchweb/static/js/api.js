@@ -1,4 +1,5 @@
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
+const SETTINGS_TARGET_HEADER = 'X-AfterTouch-Settings-Target';
 
 async function req(url, opts = {}) {
     const r = await fetch(url, opts);
@@ -36,6 +37,45 @@ async function checkedReq(url, opts = {}) {
     return response;
 }
 
+// settingsMutation returns the settings API's own answer, which already says
+// whether a change was confirmed, rejected or unverified. Only a request that
+// produced no such answer is ambiguous: a transport failure, or a non-JSON 5xx
+// from a proxy or a timeout, can come after the speaker applied the change, so
+// it is reported as unverified rather than rejected. A non-JSON 4xx never
+// reached the handler that talks to the speaker.
+async function settingsMutation(url, method, targetIdentity, body) {
+    const headers = { [SETTINGS_TARGET_HEADER]: targetIdentity };
+    const options = { method, headers };
+    if (body !== undefined) {
+        Object.assign(headers, JSON_HEADERS);
+        options.body = JSON.stringify(body);
+    }
+
+    let response;
+    try {
+        response = await fetch(url, options);
+    } catch (_) {
+        return {
+            success: false,
+            outcome: 'unverified',
+            error: 'The request did not complete; the change may or may not have been applied.',
+        };
+    }
+
+    try {
+        return await response.json();
+    } catch (_) {
+        if (response.status >= 400 && response.status < 500) {
+            return { success: false, error: `Request failed (${response.status})` };
+        }
+        return {
+            success: false,
+            outcome: 'unverified',
+            error: `The service answered ${response.status} without a result; the change may or may not have been applied.`,
+        };
+    }
+}
+
 export const api = {
     devices: () => req('/api/control/devices'),
     device: (id) => req(`/api/control/devices/${id}`),
@@ -43,6 +83,24 @@ export const api = {
     // which would otherwise poll every field to answer one question.
     deviceNowPlaying: (id) => req(`/api/control/devices/${id}/now-playing`),
     removeDevice: (id) => req(`/api/control/devices/${id}`, { method: 'DELETE' }),
+    settings: (id) => req(`/api/control/devices/${id}/settings/`),
+    setClockDisplay: (id, targetIdentity, body) => settingsMutation(
+        `/api/control/devices/${id}/settings/clock-display`, 'PATCH', targetIdentity, body),
+    setClockTime: (id, targetIdentity) => settingsMutation(
+        `/api/control/devices/${id}/settings/clock-time`, 'POST', targetIdentity),
+    setSystemTimeout: (id, targetIdentity, enabled) => settingsMutation(
+        `/api/control/devices/${id}/settings/system-timeout`, 'PATCH', targetIdentity, { enabled }),
+    setLanguage: (id, targetIdentity, code) => settingsMutation(
+        `/api/control/devices/${id}/settings/language`, 'PATCH', targetIdentity, { code }),
+    setSync: (id, targetIdentity, mode) => settingsMutation(
+        `/api/control/devices/${id}/settings/sync`, 'PATCH', targetIdentity, { mode }),
+    bluetoothPair: (id, targetIdentity) => settingsMutation(
+        `/api/control/devices/${id}/settings/bluetooth/pair`, 'POST', targetIdentity),
+    clearBluetoothPairings: (id, targetIdentity) => settingsMutation(
+        `/api/control/devices/${id}/settings/bluetooth/pairings?confirmed=true`, 'DELETE', targetIdentity),
+    setSourceName: (id, targetIdentity, source, sourceAccount, name) => settingsMutation(
+        `/api/control/devices/${id}/settings/source-name`, 'PATCH', targetIdentity,
+        { source, sourceAccount, name }),
     discover: () => req('/api/control/discover', { method: 'POST' }),
     key: (id, key) => req(`/api/control/devices/${id}/key/${key}`, { method: 'POST' }),
     // Checked variants of the mutations the discrete-command hook issues. They
