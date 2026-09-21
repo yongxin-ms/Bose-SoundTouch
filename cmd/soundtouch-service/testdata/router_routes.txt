@@ -6,6 +6,7 @@ DELETE   /accounts/{account}/group/                                   handlers.(
 DELETE   /accounts/{account}/group/{groupId}                          handlers.(*Server).HandleUnsupported-fm
 DELETE   /api/control/devices/{id}/                                   soundtouchweb.(*WebApp).HandleDeleteDevice-fm
 DELETE   /api/control/devices/{id}/library/servers/{account}          soundtouchweb.(*WebApp).HandleRemoveLibraryServer-fm
+DELETE   /api/control/devices/{id}/preset/{slot}                      soundtouchweb.(*WebApp).HandleRemovePreset-fm
 DELETE   /api/control/devices/{id}/settings/bluetooth/pairings        soundtouchweb.(*WebApp).HandleClearBluetoothPairings-fm
 DELETE   /api/control/devices/{id}/stereo-pair/                       soundtouchweb.(*WebApp).HandleDissolveStereoPair-fm
 DELETE   /api/setup/devices/{deviceId}                                handlers.(*Server).HandleRemoveDevice-fm
@@ -39,6 +40,7 @@ GET      /accounts/{account}/full                                     handlers.(
 GET      /accounts/{account}/sources                                  handlers.(*Server).HandleUnsupported-fm
 GET      /admin                                                       handlers.(*Server).HandleAdmin-fm
 GET      /api/announcements                                           handlers.(*Server).HandleListAnnouncements-fm
+GET      /api/control/catalog                                         soundtouchweb.(*WebApp).HandleCatalog-fm
 GET      /api/control/devices/                                        soundtouchweb.(*WebApp).HandleAPIDevices-fm
 GET      /api/control/devices/{id}/                                   soundtouchweb.(*WebApp).HandleAPIDevice-fm
 GET      /api/control/devices/{id}/action/{action}                    soundtouchweb.(*WebApp).HandleAPIControl-fm
@@ -48,7 +50,9 @@ GET      /api/control/devices/{id}/now-playing                        soundtouch
 GET      /api/control/devices/{id}/power-status                       soundtouchweb.(*WebApp).HandleDevicePowerStatus-fm
 GET      /api/control/devices/{id}/recents                            soundtouchweb.(*WebApp).HandleDeviceRecents-fm
 GET      /api/control/devices/{id}/settings/                          soundtouchweb.(*WebApp).HandleGetDeviceSettings-fm
+GET      /api/control/devices/{id}/sources-elsewhere                  soundtouchweb.(*WebApp).HandleSourcesElsewhere-fm
 GET      /api/control/devices/{id}/stereo-pair/                       soundtouchweb.(*WebApp).HandleGetStereoPair-fm
+GET      /api/control/devices/{id}/stored-presets/                    soundtouchweb.(*WebApp).HandleStoredPresets-fm
 GET      /api/control/devices/{id}/ws                                 soundtouchweb.(*WebApp).HandleDeviceWebSocket-fm
 GET      /api/control/devices/{id}/zone/                              soundtouchweb.(*WebApp).HandleGetZone-fm
 GET      /api/control/devices/{id}/zone/candidates                    soundtouchweb.(*WebApp).HandleGetZoneCandidates-fm
@@ -210,7 +214,10 @@ POST     /api/control/devices/{id}/providers/tunein/play              soundtouch
 POST     /api/control/devices/{id}/providers/url/play                 soundtouchweb.(*WebApp).HandlePlayURL-fm
 POST     /api/control/devices/{id}/settings/bluetooth/pair            soundtouchweb.(*WebApp).HandleEnterBluetoothPairing-fm
 POST     /api/control/devices/{id}/settings/clock-time                soundtouchweb.(*WebApp).HandleSetClockTime-fm
+POST     /api/control/devices/{id}/sources-elsewhere/add              soundtouchweb.(*WebApp).HandleAddSourceElsewhere-fm
 POST     /api/control/devices/{id}/stereo-pair/                       soundtouchweb.(*WebApp).HandleCreateStereoPair-fm
+POST     /api/control/devices/{id}/stored-presets/adopt               soundtouchweb.(*WebApp).HandleAdoptSpeakerPreset-fm
+POST     /api/control/devices/{id}/stored-presets/repair              soundtouchweb.(*WebApp).HandleRepairStoredPresets-fm
 POST     /api/control/devices/{id}/volume/{volume}                    soundtouchweb.(*WebApp).HandleDirectVolumeControl-fm
 POST     /api/control/devices/{id}/zone/add/{slaveId}                 soundtouchweb.(*WebApp).HandleZoneAdd-fm
 POST     /api/control/devices/{id}/zone/dissolve                      soundtouchweb.(*WebApp).HandleZoneDissolve-fm
@@ -218,6 +225,7 @@ POST     /api/control/devices/{id}/zone/leave                         soundtouch
 POST     /api/control/devices/{id}/zone/remove/{slaveId}              soundtouchweb.(*WebApp).HandleZoneRemove-fm
 POST     /api/control/discover                                        soundtouchweb.(*WebApp).MountWeb
 POST     /api/mgmt/accounts/{accountId}/language                      handlers.(*Server).HandleMgmtUpdateAccountLanguage-fm
+POST     /api/mgmt/accounts/{accountId}/preset-sync                   handlers.(*Server).HandleMgmtUpdateAccountPresetSync-fm
 POST     /api/mgmt/accounts/{accountId}/provider-settings             handlers.(*Server).HandleMgmtUpdateAccountProviderSetting-fm
 POST     /api/mgmt/amazon/confirm                                     handlers.(*Server).HandleMgmtAmazonConfirm-fm
 POST     /api/mgmt/amazon/init                                        handlers.(*Server).HandleMgmtAmazonInit-fm
@@ -255,6 +263,7 @@ POST     /core02/svc-bmx-adapter-siriusxm-everest-eco1/prod/live-adapter/* handl
 POST     /customer/account/{account}                                  handlers.(*Server).HandleMargeUpdateAccountProfile-fm
 POST     /customer/account/{account}/password                         handlers.(*Server).HandleMargeChangePassword-fm
 POST     /mgmt/accounts/{accountId}/language                          handlers.(*Server).HandleMgmtUpdateAccountLanguage-fm
+POST     /mgmt/accounts/{accountId}/preset-sync                       handlers.(*Server).HandleMgmtUpdateAccountPresetSync-fm
 POST     /mgmt/accounts/{accountId}/provider-settings                 handlers.(*Server).HandleMgmtUpdateAccountProviderSetting-fm
 POST     /mgmt/amazon/confirm                                         handlers.(*Server).HandleMgmtAmazonConfirm-fm
 POST     /mgmt/amazon/init                                            handlers.(*Server).HandleMgmtAmazonInit-fm

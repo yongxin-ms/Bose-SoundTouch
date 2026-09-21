@@ -360,6 +360,16 @@ async function fetchSettings() {
         if (settings.update_check_enabled !== undefined) {
             document.getElementById("update-check-enabled").checked = settings.update_check_enabled;
         }
+        // An unset catalog size is an empty box, not a zero: zero means the
+        // operator switched the catalog off (issue 754).
+        const catalogSizeEl = document.getElementById("catalog-size");
+        if (catalogSizeEl) {
+            catalogSizeEl.value =
+                settings.catalog_size === null || settings.catalog_size === undefined
+                    ? ""
+                    : settings.catalog_size;
+        }
+
         if (settings.default_landing) {
             document.getElementById("default-landing").value = settings.default_landing;
         }
@@ -501,12 +511,30 @@ async function updateLoggingSettings() {
     }
 }
 
+// readCatalogSize returns the box as a string, which is how the three states
+// travel: "" means "not configured, use the default", and a number sets the
+// cap, including "0" for switching the catalog off. The field is omitted only
+// when the box is not on the page at all, and omitting it preserves whatever
+// is stored.
+function readCatalogSize() {
+    const el = document.getElementById("catalog-size");
+    if (!el) return undefined;
+
+    const raw = el.value.trim();
+    if (raw === "") return "";
+
+    const parsed = Number.parseInt(raw, 10);
+
+    return Number.isNaN(parsed) ? "" : String(Math.max(0, parsed));
+}
+
 async function updateSettings() {
     const httpsOverrideEl = document.getElementById("https-url-override");
     const settings = {
         server_url: document.getElementById("target-domain").value,
         https_server_url_override: httpsOverrideEl ? httpsOverrideEl.value.trim() : "",
         default_landing: document.getElementById("default-landing").value,
+        catalog_size: readCatalogSize(),
         admin_area_auth: document.getElementById("admin-area-auth").value,
         discovery_interval: document.getElementById("discovery-interval").value,
         discovery_enabled: document.getElementById("discovery-enabled").checked,
@@ -1101,7 +1129,7 @@ async function fetchAccountDetails(accountId) {
         if (metadataEl) {
             const warningNotice = data.account.is_placeholder ?
                 `<div style="background: #fff3cd; color: #856404; padding: 10px; border: 1px solid #ffeeba; border-radius: 4px; margin-bottom: 10px; font-size: 0.85em;">
-                    <strong>Notice:</strong> This account hasn't saved any custom settings yet (language, provider preferences). Defaults are in effect — they'll be saved once you change something below.
+                    <strong>Notice:</strong> This account hasn't saved any custom settings yet (language, preset sync, provider preferences). Defaults are in effect — they'll be saved once you change something below.
                 </div>` : "";
 
             metadataEl.innerHTML = `
@@ -1114,6 +1142,19 @@ async function fetchAccountDetails(accountId) {
                             <option value="de" ${data.account.preferred_language === "de" ? "selected" : ""}>de</option>
                         </select>
                         <span id="language-update-status" style="margin-left: 8px; font-size: 0.8em; display: none;">Saving...</span>
+                    </td></tr>
+                    <tr><td style="padding: 4px"><strong>Preset sync:</strong></td><td style="padding: 4px">
+                        <select id="account-preset-sync-select" style="font-size: 0.9em; padding: 2px;">
+                            <option value="auto" ${!data.account.preset_sync || data.account.preset_sync === "auto" ? "selected" : ""}>auto (share unless speakers differ)</option>
+                            <option value="on" ${data.account.preset_sync === "on" ? "selected" : ""}>on (always share)</option>
+                            <option value="off" ${data.account.preset_sync === "off" ? "selected" : ""}>off (never overwrite)</option>
+                        </select>
+                        <span id="preset-sync-update-status" style="margin-left: 8px; font-size: 0.8em; display: none;">Saving...</span>
+                        <div style="font-size: 0.8em; color: #666; margin-top: 2px;">
+                            Saving or clearing a single preset on one speaker of this account applies it to
+                            the others. A speaker without presets adopts them in every mode. Importing a
+                            speaker's presets with "Sync Data" stays on that speaker.
+                        </div>
                     </td></tr>
                     <tr><td style="padding: 4px"><strong>Provider Settings:</strong></td><td style="padding: 4px">
                         ${data.account.provider_settings && data.account.provider_settings.length > 0 ?
@@ -1187,6 +1228,44 @@ async function fetchAccountDetails(accountId) {
                         }
                     } catch (error) {
                         console.error("Failed to update language", error);
+                        if (statusEl) {
+                            statusEl.innerText = "Error!";
+                            statusEl.style.color = "#dc3545";
+                        }
+                    }
+                });
+            }
+
+            const presetSyncSelect = document.getElementById("account-preset-sync-select");
+            if (presetSyncSelect) {
+                presetSyncSelect.addEventListener("change", async (e) => {
+                    const statusEl = document.getElementById("preset-sync-update-status");
+                    const mode = e.target.value;
+                    if (statusEl) {
+                        statusEl.innerText = "Saving...";
+                        statusEl.style.display = "inline";
+                        statusEl.style.color = "#666";
+                    }
+                    try {
+                        const response = await fetch(`/api/mgmt/accounts/${encodeURIComponent(data.account.account_id)}/preset-sync`, {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                            },
+                            body: JSON.stringify({ preset_sync: mode }),
+                        });
+                        if (!response.ok) {
+                            throw new Error(await response.text());
+                        }
+                        if (statusEl) {
+                            statusEl.innerText = "Saved!";
+                            statusEl.style.color = "#28a745";
+                            setTimeout(() => {
+                                statusEl.style.display = "none";
+                            }, 2000);
+                        }
+                    } catch (error) {
+                        console.error("Failed to update preset sync", error);
                         if (statusEl) {
                             statusEl.innerText = "Error!";
                             statusEl.style.color = "#dc3545";

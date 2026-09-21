@@ -1098,6 +1098,256 @@ img.preset-source-icon { object-fit: contain; filter: var(--content-icon-filter)
    otherwise disappear into it. */
 .preset-slot-wrap.active .preset-save-btn:disabled { color: var(--accent-fg); }
 
+/* The pencil sits left of the star in the same corner, so a tile carries its
+   two save gestures in one place: the star stores what is playing, the pencil
+   fills the slot from the catalog (issue 754). */
+.preset-edit-wrap { position: absolute; right: 1.5rem; bottom: .2rem; z-index: 1; display: flex; }
+.preset-edit-btn {
+    font-size: .75rem; line-height: 1;
+    background: none; border: none; padding: 2px 3px;
+    border-radius: 3px; cursor: pointer;
+    color: var(--text-dim); opacity: .8;
+    transition: opacity .15s, color .15s;
+}
+.preset-edit-btn:hover, .preset-edit-btn:focus-visible { opacity: 1; color: var(--text); }
+.preset-edit-btn.open { opacity: 1; color: var(--accent); }
+.preset-slot-wrap.active .preset-edit-btn { color: var(--accent-fg); }
+
+/* ── Sources on other speakers ───────────────────────────────────────────── */
+/* Rendered only when there is something this speaker could be given, so a
+   single-speaker setup never sees it. */
+.sources-elsewhere { margin-top: .75rem; }
+.sources-elsewhere-title {
+    margin: 0 0 .4rem; font-size: .7rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim);
+}
+.sources-elsewhere-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; }
+.sources-elsewhere-row {
+    display: flex; align-items: center; gap: .5rem;
+    padding: .3rem .4rem;
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.sources-elsewhere-icon { width: 16px; height: 16px; font-size: 13px; line-height: 1; }
+img.sources-elsewhere-icon { object-fit: contain; filter: var(--content-icon-filter); opacity: .85; }
+.sources-elsewhere-text { display: flex; flex-direction: column; min-width: 0; }
+.sources-elsewhere-name { font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sources-elsewhere-meta { font-size: .7rem; color: var(--text-dim); }
+.sources-elsewhere-row .sources-elsewhere-text { flex: 1 1 auto; }
+.sources-elsewhere-add {
+    padding: .25rem .5rem; font-size: .75rem; cursor: pointer;
+    color: var(--text-dim); background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius);
+}
+.sources-elsewhere-add:hover:not(:disabled), .sources-elsewhere-add:focus-visible:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.sources-elsewhere-add:disabled { opacity: .5; cursor: default; }
+.sources-elsewhere-error { margin: 0 0 .4rem; font-size: .78rem; color: var(--danger); }
+
+/* ── Stored-preset problems ──────────────────────────────────────────────── */
+/* Only ever rendered when the stored list and the speaker disagree, so it can
+   afford to be noticeable. */
+.stored-presets {
+    margin-bottom: .6rem;
+    border: 1px solid var(--warning); border-radius: var(--radius);
+    background: var(--surface);
+}
+.stored-presets-summary {
+    display: flex; align-items: center; gap: .6rem; width: 100%;
+    padding: .55rem .6rem; text-align: left; cursor: pointer;
+    background: none; border: none; color: var(--text);
+}
+.stored-presets-mark {
+    flex: 0 0 1.4rem; height: 1.4rem; border-radius: 50%;
+    background: var(--warning); color: var(--surface);
+    font-size: .8rem; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+}
+.stored-presets-text { display: flex; flex-direction: column; gap: .1rem; min-width: 0; }
+.stored-presets-headline { font-size: .85rem; }
+.stored-presets-hint { font-size: .72rem; color: var(--text-dim); }
+.stored-presets-body {
+    padding: 0 .6rem .6rem;
+    display: flex; flex-direction: column; gap: .5rem;
+}
+.stored-presets-note { margin: 0; font-size: .78rem; color: var(--text-dim); }
+.stored-presets-note.error { color: var(--danger); }
+.stored-presets-slots { display: flex; flex-direction: column; gap: .35rem; }
+/* One side per line, so a station name gets the full width instead of being
+   ellipsised down to "bigFM ...". The sides are display: contents, which drops
+   their children into the grid directly: labels, names and the two choose
+   buttons each land in one shared column and line up across both rows. */
+.stored-presets-slot {
+    display: grid; align-items: center;
+    grid-template-columns: auto auto minmax(0, 1fr) auto;
+    column-gap: .5rem; row-gap: .3rem;
+    padding: .45rem .5rem;
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.stored-presets-slot > .stored-presets-button { grid-row: 1 / span 2; width: 1.7rem; align-self: center; }
+.stored-presets-side { display: contents; }
+.stored-presets-side-label {
+    font-size: .65rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--text-dim);
+}
+.stored-presets-side-name {
+    flex: 1 1 auto; min-width: 0; font-size: .82rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.stored-presets-choose {
+    padding: .25rem .45rem; font-size: .72rem; cursor: pointer; white-space: nowrap;
+    color: var(--text-dim); background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius);
+}
+.stored-presets-choose:hover:not(:disabled), .stored-presets-choose:focus-visible:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.stored-presets-choose:disabled { opacity: .5; cursor: default; }
+.stored-presets-choose { justify-self: end; }
+
+/* Too narrow for four columns: keep the number beside the pair and let each
+   side wrap within its own line. */
+@media (max-width: 40rem) {
+    .stored-presets-slot { grid-template-columns: auto minmax(0, 1fr); }
+    .stored-presets-side {
+        display: flex; align-items: center; gap: .4rem; flex-wrap: wrap;
+        grid-column: 2; min-width: 0;
+    }
+    .stored-presets-side-name { flex: 1 1 6rem; }
+}
+
+.stored-presets-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .25rem; }
+.stored-presets-row {
+    display: flex; align-items: center; gap: .5rem;
+    padding: .35rem .4rem;
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+}
+.stored-presets-row.broken { border-color: var(--warning); }
+.stored-presets-button {
+    flex: 0 0 1.7rem; height: 1.7rem; border-radius: 4px;
+    border: 1px solid var(--border); color: var(--text-dim);
+    font-size: .75rem; font-weight: 700;
+    display: flex; align-items: center; justify-content: center;
+}
+.stored-presets-detail { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.stored-presets-name { font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stored-presets-meta { font-size: .7rem; color: var(--text-dim); }
+.stored-presets-remove, .stored-presets-fix {
+    padding: .3rem .5rem; font-size: .78rem; cursor: pointer;
+    color: var(--text-dim); background: var(--bg);
+    border: 1px solid var(--border); border-radius: var(--radius);
+}
+.stored-presets-remove:hover:not(:disabled), .stored-presets-fix:hover:not(:disabled) { color: var(--text); }
+.stored-presets-fix { align-self: flex-start; color: var(--text); border-color: var(--warning); }
+.stored-presets-remove:disabled, .stored-presets-fix:disabled { opacity: .5; cursor: default; }
+
+/* ── Catalog picker ──────────────────────────────────────────────────────── */
+.catalog-picker {
+    margin-top: .6rem; padding: .6rem;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius);
+    display: flex; flex-direction: column; gap: .5rem;
+}
+.catalog-picker-head { display: flex; align-items: center; justify-content: space-between; gap: .5rem; }
+.catalog-picker-title {
+    margin: 0; font-size: .8rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .06em; color: var(--text-dim);
+}
+.catalog-picker-close {
+    background: none; border: none; cursor: pointer;
+    color: var(--text-dim); font-size: .9rem; line-height: 1; padding: .2rem .3rem;
+}
+.catalog-picker-close:hover, .catalog-picker-close:focus-visible { color: var(--text); }
+.catalog-picker-note { margin: 0; font-size: .8rem; color: var(--text-dim); }
+.catalog-picker-note.error { color: var(--danger); }
+.catalog-picker-filter {
+    width: 100%; box-sizing: border-box;
+    padding: .4rem .5rem; font: inherit; font-size: .85rem;
+    color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: var(--radius);
+}
+/* Capped rather than unbounded: the catalog holds up to 30 entries, and a
+   list that long would push the rest of the device page off the screen. */
+.catalog-picker-list {
+    list-style: none; margin: 0; padding: 0;
+    display: flex; flex-direction: column; gap: .25rem;
+    max-height: 17rem; overflow-y: auto;
+}
+.catalog-entry {
+    width: 100%; display: flex; align-items: center; gap: .5rem;
+    padding: .35rem .4rem; text-align: left; cursor: pointer;
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: var(--radius); color: var(--text);
+}
+.catalog-entry:hover:not(:disabled), .catalog-entry:focus-visible:not(:disabled) { border-color: var(--accent); }
+.catalog-entry:disabled { cursor: default; opacity: .6; }
+.catalog-entry.saving { border-color: var(--accent); }
+.catalog-entry-thumb {
+    flex: 0 0 32px; width: 32px; height: 32px;
+    border: 1px solid var(--border); border-radius: 4px;
+    background: var(--bg); overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+}
+.catalog-entry-thumb img { width: 100%; height: 100%; object-fit: cover; }
+/* The theme filter is scoped to img, as everywhere else a SourceIcon is used:
+   applied to the emoji span it washes the brand emoji out. */
+.catalog-entry-icon { width: 18px; height: 18px; font-size: 14px; line-height: 1; }
+img.catalog-entry-icon { object-fit: contain; filter: var(--content-icon-filter); opacity: .85; }
+/* Content this speaker has no source for. Dimmed and labelled rather than
+   disabled: the list the player holds can be minutes old, so the service
+   re-checks against the speaker and has the final word. */
+.catalog-entry.unavailable { border-style: dashed; }
+.catalog-entry.unavailable .catalog-entry-name { color: var(--text-dim); }
+.catalog-entry-warn { color: var(--warning); }
+
+.catalog-entry-text { display: flex; flex-direction: column; min-width: 0; gap: .1rem; }
+.catalog-entry-name { font-size: .85rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.catalog-entry-meta { font-size: .7rem; color: var(--text-dim); }
+
+.catalog-current {
+    display: flex; flex-direction: column; gap: .4rem;
+    padding-bottom: .5rem; border-bottom: 1px solid var(--border);
+}
+.catalog-rename { display: flex; align-items: center; gap: .4rem; }
+.catalog-rename-input {
+    flex: 1 1 auto; min-width: 0;
+    padding: .3rem .45rem; font: inherit; font-size: .85rem;
+    color: var(--text); background: var(--bg);
+    border: 1px solid var(--border); border-radius: var(--radius);
+}
+.catalog-field-label {
+    font-size: .7rem; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--text-dim);
+}
+.catalog-move { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap; }
+.catalog-move-slots { display: flex; gap: .3rem; }
+.catalog-move-slot {
+    width: 1.9rem; height: 1.9rem; border-radius: var(--radius);
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-size: .78rem; font-weight: 700; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+}
+.catalog-move-slot:hover:not(:disabled), .catalog-move-slot:focus-visible:not(:disabled) { border-color: var(--accent); }
+/* An occupied target is not disabled -- replacing one is a normal thing to
+   want -- it just says so before the move happens. */
+.catalog-move-slot.occupied { border-style: dashed; color: var(--text-dim); }
+.catalog-move-slot.pending { border-color: var(--danger); color: var(--danger); }
+.catalog-move-slot:disabled { opacity: .5; cursor: default; }
+
+.catalog-picker-foot {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: .4rem; border-top: 1px solid var(--border); padding-top: .5rem;
+}
+.catalog-picker-confirm { display: flex; gap: .4rem; }
+/* The editor's small text buttons. Rename and clear keep separate class names
+   rather than sharing one: they are the two ends of the panel, and a selector
+   that matches both would have a click land on whichever comes first. */
+.catalog-action-btn, .catalog-clear-btn {
+    padding: .3rem .5rem; font-size: .78rem;
+    color: var(--text-dim); background: var(--bg);
+    border: 1px solid var(--border); border-radius: var(--radius); cursor: pointer;
+}
+.catalog-action-btn:hover:not(:disabled), .catalog-action-btn:focus-visible:not(:disabled),
+.catalog-clear-btn:hover:not(:disabled), .catalog-clear-btn:focus-visible:not(:disabled) { color: var(--text); }
+.catalog-clear-btn.danger { color: var(--danger); border-color: var(--danger); }
+.catalog-action-btn:disabled, .catalog-clear-btn:disabled { opacity: .5; cursor: default; }
+
 /* ── Sources ─────────────────────────────────────────────────────────────── */
 .source-list { display: flex; flex-wrap: wrap; gap: .4rem; }
 

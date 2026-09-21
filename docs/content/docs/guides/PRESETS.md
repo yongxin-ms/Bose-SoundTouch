@@ -74,6 +74,164 @@ source, and a name. Two consequences worth knowing:
   disappears from a directory, the stored location may no longer resolve. Save
   it again to fix it.
 
+## Change a slot without playing anything
+
+The **✎** next to each preset tile opens the slot editor. It lists what
+AfterTouch has seen this household play or store, so filling a slot is picking
+from that list rather than finding the station again first.
+
+From the editor you can:
+
+- **Fill the slot** from the list. Type in the filter box to narrow it.
+- **Rename** what is in the slot. The name is yours; it does not have to match
+  what the station calls itself.
+- **Move it to another slot.** Press a slot number under "Move to". A slot that
+  already holds something is marked, says what it would replace, and needs a
+  second press.
+- **Empty the slot.** The station stays on the list, so this loses the slot's
+  contents, not the station.
+
+Nothing here needs the speaker to be playing, and none of it involves editing
+files. If you have been recovering presets by hand from `Presets.xml` or over
+SSH, this replaces that.
+
+### Content another speaker has
+
+The list is shared across your speakers, so it also offers things only one of
+them can play: an album on a media server this speaker has not discovered, or a
+service linked on another one. Those entries are dimmed and say why, for
+example "not on this speaker's Library accounts".
+
+You can still pick one. The marking is based on the source list the player last
+read, which can be a few minutes old, so AfterTouch checks again against the
+speaker before writing and refuses with what is missing, naming the sources the
+speaker does have. To use such an entry here, add that media server or link that
+service on this speaker first, then pick it again.
+
+### The list, and what is on it
+
+The list is a catalog of what AfterTouch has seen: every preset it has stored
+and everything that has played, across all your speakers, whichever one it
+happened on. That is what makes it useful for two jobs at once.
+
+- **Getting something back.** A slot that gets emptied, by you or by anything
+  else, leaves its station on the list. Putting it back is picking it again.
+- **Copying between speakers.** Open the editor on the second speaker and pick
+  the same entry.
+
+An entry already sitting in a slot is still listed, and says which slot it is
+in. Putting the same station in two slots is allowed; it is sometimes what you
+want.
+
+The list holds the 100 most recently seen entries, which costs about 45 KB.
+Change that in the admin UI under Settings ("Preset catalog size"), or by
+setting `catalog_size` in `settings.json`:
+
+```json
+{ "catalog_size": 250 }
+```
+
+When the list is full, stations that merely played are dropped before ones that
+were saved as a preset, so what you are most likely to want back stays longest.
+
+Setting it to `0` turns the catalog off and discards what is stored, which is
+worth knowing if you run AfterTouch on the speaker itself and want to keep the
+flash volume as quiet as possible. An empty box (or leaving the setting out of
+`settings.json`) keeps the default of 100, and follows it if the default
+changes later.
+
+### When AfterTouch and the speaker disagree
+
+Above the preset tiles, a warning appears if what AfterTouch has stored for a
+speaker does not match what the speaker reports, for example "AfterTouch stores
+8 presets for this speaker, 2 of which it can never play". On a healthy setup
+there is nothing there.
+
+Open it and you see the stored rows as stored, each saying why it cannot be
+played: no such button on this speaker, no button number at all, or nothing to
+play. Remove them one at a time, or use the button that removes all the rows
+the speaker cannot play.
+
+This matters beyond tidiness. A stored list with more rows than the speaker has
+buttons is why:
+
+- **"Sync Data" is refused as destructive.** Importing the speaker's six
+  presets would shrink the stored eight, and a shrinking import is refused
+  unless you confirm it.
+- **A preset you just saved comes back as the old one.** AfterTouch serves its
+  stored list to the speaker, so the extra rows keep winning.
+
+Where a button holds different things on the two sides, it is listed with both,
+and you pick one:
+
+- **Keep ours** puts what AfterTouch stores onto the speaker, so the speaker
+  catches up now instead of at its next fetch.
+- **Take the speaker's** stores what the speaker has, so AfterTouch stops
+  handing back the old entry.
+
+Either way the other one stays in the list you fill slots from, so a choice can
+be undone. This is the piece "Sync Data" cannot do: that imports a speaker's
+whole list at once, and refuses outright when it would shrink what is stored.
+
+**Remove** deletes the row from what AfterTouch stores. It presses nothing on
+the speaker, and it does not lose the station: that stays in the list you pick
+from, so you can put it straight back into a slot.
+
+This is the one edit that goes to AfterTouch rather than to the speaker. The
+rows exist only in AfterTouch, and some of them name no button the speaker
+could be asked about.
+
+## Presets on several speakers
+
+Speakers that share one AfterTouch account share their presets: saving or
+clearing a preset on one applies it to the others. How quickly they show it
+depends on your setup, see "When the other speakers pick it up" below.
+
+What happens by default:
+
+- **One speaker, or speakers that already hold the same presets**: sharing is
+  on, so a change reaches all of them.
+- **A speaker added later with no presets**: it adopts the account's presets.
+- **Speakers that already hold different presets**: nothing is overwritten.
+  AfterTouch leaves them as they are until you say which way it should go.
+
+To change that for an account:
+
+```bash
+curl -X POST http://192.0.2.10:8000/api/mgmt/accounts/<accountId>/preset-sync \
+  -H 'Content-Type: application/json' -d '{"preset_sync": "on"}'
+```
+
+`on` always shares a change, `off` never overwrites another speaker's preset
+(a speaker with no presets still adopts them, since nothing is lost that way),
+and `auto` is the default described above.
+
+### Sharing a preset is not the same as "Sync Data"
+
+The two move in opposite directions, which is easy to mix up:
+
+|                                        | What it does                                            | Reaches other speakers                   |
+|----------------------------------------|---------------------------------------------------------|------------------------------------------|
+| Saving or clearing one preset          | writes that slot, on the speaker and in AfterTouch      | yes, this is the sharing described above |
+| "Sync Data" (admin UI) or `setup sync` | imports one speaker's whole preset list into AfterTouch | no, it stays on that speaker             |
+
+An import takes the list exactly as that one speaker reports it at that
+moment. If that list is shorter or out of date, handing it to every other
+speaker would spread the loss, so an import is never shared. AfterTouch even
+refuses an import that would shrink what it already holds, unless you confirm
+it.
+
+### When the other speakers pick it up
+
+Storing the preset in AfterTouch is the sharing. The speakers fetch their own
+presets, so each one picks the change up by itself: at its next fetch, when it
+is switched on or rebooted, or when you press "Refresh sources on speaker".
+
+Where AfterTouch can reach the speakers, it also nudges them, and the change
+shows up within seconds. That nudge is an accelerator, not the mechanism: if
+AfterTouch runs somewhere it cannot reach them (a public cloud host, for
+example), the presets still arrive, just whenever the speakers next ask.
+
 ## From the command line
 
 `soundtouch-cli` talks to the speaker directly, and is the right tool for

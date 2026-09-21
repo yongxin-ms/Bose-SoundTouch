@@ -1513,7 +1513,15 @@ func (ds *DataStore) savePresetsNoLock(account, device string, presets []models.
 
 	header := []byte(xml.Header)
 
-	return ds.atomicWriteFile(path, append(header, data...))
+	if err := ds.atomicWriteFile(path, append(header, data...)); err != nil {
+		return err
+	}
+
+	// Every preset write, whoever made it, also files what it stored in the
+	// catalog, so a slot emptied later can be picked again (issue 754).
+	ds.RecordCatalogEntries(catalogEntriesFromPresets(device, presets))
+
+	return nil
 }
 
 // atomicWriteFile writes data to filename atomically AND durably: it writes a
@@ -1843,7 +1851,13 @@ func (ds *DataStore) saveRecentsNoLock(account, device string, recents []models.
 
 	header := []byte(xml.Header)
 
-	return ds.atomicWriteFile(path, append(header, data...))
+	if err := ds.atomicWriteFile(path, append(header, data...)); err != nil {
+		return err
+	}
+
+	ds.RecordCatalogEntries(catalogEntriesFromRecents(device, recents))
+
+	return nil
 }
 
 // SaveDeviceInfo saves device information for the specified account and device.
@@ -2881,6 +2895,25 @@ func (ds *DataStore) GetETagForPresets(account, device string) int64 {
 	return info.ModTime().UnixNano() / int64(time.Millisecond)
 }
 
+// DeviceDirExists reports whether this account holds a directory for the
+// device. It is the cheap "is this pairing on disk at all" question, used
+// where a caller has been handed an account by a speaker and needs to know
+// whether we have anything filed under it.
+func (ds *DataStore) DeviceDirExists(account, device string) bool {
+	if ds == nil || account == "" || device == "" {
+		return false
+	}
+
+	if !IsSafeIdentifier(account) || !IsSafeIdentifier(device) {
+		return false
+	}
+
+	ds.fileMutex.RLock()
+	defer ds.fileMutex.RUnlock()
+
+	return ds.rootExists(ds.AccountDeviceDir(account, device))
+}
+
 // HasConfiguredSources reports whether a non-empty Sources.xml file exists for
 // the given account and device. A present-but-0-byte file (truncated by an
 // unclean power-cut) counts as absent. See #458.
@@ -3067,6 +3100,15 @@ type Settings struct {
 	// The tri-state (rather than a plain bool) is what lets "never decided"
 	// be told apart from "explicitly chose off" once that default flips.
 	AdminAreaAuth string `json:"admin_area_auth,omitempty"`
+
+	// CatalogSize caps the preset/source catalog (issue 754): the entries
+	// AfterTouch has seen, kept so an emptied slot can be picked again instead
+	// of being recovered from hand-edited XML. Unset means catalog.DefaultSize
+	// (100 entries, roughly 45 KB);
+	// zero turns the catalog off and drops what is stored, which is the knob an
+	// on-device install on a tight flash volume needs. A pointer, because "never
+	// configured" and "deliberately disabled" have to be tellable apart.
+	CatalogSize *int `json:"catalog_size,omitempty"`
 }
 
 // GetSettings retrieves the global service settings.

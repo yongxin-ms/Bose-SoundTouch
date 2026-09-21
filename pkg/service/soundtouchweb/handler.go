@@ -18,6 +18,7 @@ import (
 	"github.com/gesellix/bose-soundtouch/pkg/client"
 	"github.com/gesellix/bose-soundtouch/pkg/models"
 	bmxpkg "github.com/gesellix/bose-soundtouch/pkg/service/bmx"
+	"github.com/gesellix/bose-soundtouch/pkg/service/catalog"
 	"github.com/gesellix/bose-soundtouch/pkg/service/soundtouchweb/webtypes"
 	"github.com/gesellix/bose-soundtouch/pkg/service/stations"
 	"github.com/gesellix/bose-soundtouch/pkg/stereopair"
@@ -118,6 +119,49 @@ type WebApp struct {
 	// datastore); DiscoverDevices then re-syncs from ExtraDeviceHosts. Standalone
 	// soundtouch-player leaves it nil and runs its own sweep.
 	TriggerDiscovery func(ctx context.Context)
+
+	// CatalogEntries, when set, returns the service's catalog of preset and
+	// source entries seen so far (issue 754), newest sighting first. The
+	// embedded build wires it to the service datastore; standalone
+	// soundtouch-player leaves it nil, which the player surfaces as "no
+	// catalog here" rather than as an empty one.
+	CatalogEntries func() []catalog.Entry
+
+	// StoredPresets, when set, returns the preset rows the service has stored
+	// for a device, as stored (issue 697). The embedded build wires it to the
+	// service datastore; standalone soundtouch-player leaves it nil, which the
+	// player surfaces as "nothing to compare against".
+	// account is the speaker's own margeAccountUUID when it reports one, so a
+	// speaker with leftover directories from an earlier pairing is read under
+	// the account it is actually being served; empty leaves the choice to the
+	// service.
+	StoredPresets func(deviceID, account string) ([]models.StoredPresetRow, error)
+
+	// RepairStoredPresets, when set, deletes stored rows by position and
+	// returns what is left. expected is the row count the caller was looking
+	// at, so a repair computed against a stale view deletes nothing.
+	//
+	// This is the one editor write the speaker cannot carry: the rows are
+	// AfterTouch's own, and several of them name no button a speaker could be
+	// asked about.
+	RepairStoredPresets func(deviceID, account string, drop []int, expected int) ([]models.StoredPresetRow, error)
+
+	// SourcesElsewhere, when set, returns the sources other speakers of this
+	// service have that the given device does not (issue 754). Identity only:
+	// see models.SourceIdentity for why a configured source cannot be handed
+	// outward as it is stored.
+	SourcesElsewhere func(deviceID, account string) ([]models.SourceIdentity, error)
+
+	// AddCanonicalSource, when set, gives a device one of the sources
+	// AfterTouch defines itself (TuneIn, Radio Browser, Local Internet
+	// Radio), reporting whether anything was added. It takes the definition
+	// from the service's own defaults, never from the speaker that has it.
+	AddCanonicalSource func(deviceID, account, sourceType string) (bool, error)
+
+	// AdoptSpeakerPreset, when set, writes one slot of the stored list from
+	// what the speaker reports, and returns the list as it now stands. The
+	// per-slot alternative to the whole-list import (issue 697).
+	AdoptSpeakerPreset func(deviceID, account string, preset models.ServicePreset) ([]models.StoredPresetRow, error)
 
 	// RemoveDeviceHook, when set, removes a device from the backing store by
 	// its device ID (MAC). The embedded build wires it to the service's
@@ -825,6 +869,14 @@ func (app *WebApp) HandleStorePresetContent(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// A preset that names a source this speaker does not have stores fine and
+	// fails at play time, which is the failure the editor exists to prevent
+	// (issue 754). Refuse before writing, and say what is missing.
+	if missing := app.checkPresetSource(device, req.Source, req.SourceAccount); missing != "" {
+		app.sendError(w, missing, http.StatusConflict)
+		return
+	}
+
 	contentItem := &models.ContentItem{
 		Source:       req.Source,
 		Type:         req.Type,
@@ -854,6 +906,43 @@ func (app *WebApp) HandleStorePresetContent(w http.ResponseWriter, r *http.Reque
 
 	err = device.Client.StorePreset(slot, contentItem)
 	app.sendControlResponse(w, err, fmt.Sprintf("Stored %s as preset %d", req.Source, slot))
+}
+
+// HandleRemovePreset empties a preset slot on the speaker (issue 754).
+//
+// It is the one editor action that destroys something, and the catalog is what
+// makes it safe to offer: the entry stays on the pick list, so an emptied slot
+// can be filled again with the same station rather than reconstructed from
+// hand-edited XML.
+//
+// The write goes to the speaker, not to the datastore, for the same reason the
+// store path does: the speaker then reports the change to AfterTouch itself,
+// which is the path that already exists and the one the preset sharing hangs
+// off (issue 495).
+func (app *WebApp) HandleRemovePreset(w http.ResponseWriter, r *http.Request) {
+	deviceID := chi.URLParam(r, "id")
+
+	device, exists := app.GetDevice(deviceID)
+	if !exists {
+		app.sendError(w, "Device not found", http.StatusNotFound)
+		return
+	}
+
+	if device.Client == nil {
+		app.sendError(w, "Device client not available", http.StatusInternalServerError)
+		return
+	}
+
+	slot, err := strconv.Atoi(chi.URLParam(r, "slot"))
+	if err != nil || slot < 1 || slot > 6 {
+		app.sendError(w, "Preset slot must be between 1 and 6", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[preset] clear device=%q slot=%d", sanitizeLog(deviceID), slot)
+
+	err = device.Client.RemovePreset(slot)
+	app.sendControlResponse(w, err, fmt.Sprintf("Cleared preset %d", slot))
 }
 
 // handleBassControl processes bass control requests

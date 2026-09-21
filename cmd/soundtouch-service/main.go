@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gesellix/bose-soundtouch/pkg/discovery"
+	"github.com/gesellix/bose-soundtouch/pkg/models"
 	"github.com/gesellix/bose-soundtouch/pkg/netcompat"
 	"github.com/gesellix/bose-soundtouch/pkg/service/amazon"
 	"github.com/gesellix/bose-soundtouch/pkg/service/bmx"
@@ -1275,7 +1276,48 @@ func initDataStore(dataDir string) *datastore.DataStore {
 		log.Printf("Warning: Failed to initialize datastore: %v", err)
 	}
 
+	// File what is already stored into the catalog (issue 754). Without this
+	// an install that has been running for months offers an empty pick list
+	// next to six stored presets, because the catalog would only ever learn
+	// from writes. Idempotent, so it costs one pass over the preset and
+	// recents files per start and changes nothing on the next one.
+	ds.BackfillCatalog()
+
 	return ds
+}
+
+// accountForDevice resolves the account a speaker's stored data lives under.
+//
+// The speaker's own margeAccountUUID wins whenever it names a directory we
+// actually have. A speaker re-paired at some point keeps its old directory,
+// and picking that one reports a disagreement that says more about the
+// leftover than about the speaker -- and a repair would then edit a file
+// nothing is being served from. Those leftovers are what the consistency
+// health check reports separately; this only has to avoid mistaking one for
+// the live list.
+//
+// Without that signal it falls back to ListAllDevices, which already sorts the
+// "default" pre-pair placeholder behind real accounts, the same choice the
+// device removal makes.
+func accountForDevice(ds *datastore.DataStore, deviceID, reportedAccount string) (account, device string, err error) {
+	if reportedAccount != "" && datastore.IsSafeIdentifier(reportedAccount) {
+		if ds.DeviceDirExists(reportedAccount, deviceID) {
+			return reportedAccount, deviceID, nil
+		}
+	}
+
+	devices, err := ds.ListAllDevices()
+	if err != nil {
+		return "", "", err
+	}
+
+	for i := range devices {
+		if devices[i].DeviceID == deviceID {
+			return devices[i].AccountID, devices[i].DeviceID, nil
+		}
+	}
+
+	return "", "", fmt.Errorf("no stored data for this speaker yet")
 }
 
 // warnIfDataDirNotWritable probes the data dir and logs an actionable message
@@ -1508,6 +1550,58 @@ func newEmbeddedWebApp(server *handlers.Server, serverURL, internalURL string, d
 
 	// UI "discover" runs the service's sweep, not a second mDNS stack.
 	webApp.TriggerDiscovery = server.DiscoverDevices
+
+	// The catalog of what this service has seen stored or played, which the
+	// player's preset editor picks from (issue 754). Standalone
+	// soundtouch-player has no datastore, so it leaves this nil.
+	webApp.CatalogEntries = ds.GetCatalog
+
+	// The stored preset list, and its repair (issue 697). Both resolve the
+	// account the speaker is filed under the same way the device removal does.
+	webApp.StoredPresets = func(deviceID, reported string) ([]models.StoredPresetRow, error) {
+		account, device, err := accountForDevice(ds, deviceID, reported)
+		if err != nil {
+			return nil, err
+		}
+
+		return ds.StoredPresets(account, device)
+	}
+
+	webApp.RepairStoredPresets = func(deviceID, reported string, drop []int, expected int) ([]models.StoredPresetRow, error) {
+		account, device, err := accountForDevice(ds, deviceID, reported)
+		if err != nil {
+			return nil, err
+		}
+
+		return ds.DropStoredPresetRows(account, device, drop, expected)
+	}
+
+	webApp.SourcesElsewhere = func(deviceID, reported string) ([]models.SourceIdentity, error) {
+		account, device, err := accountForDevice(ds, deviceID, reported)
+		if err != nil {
+			return nil, err
+		}
+
+		return ds.SourcesElsewhere(account, device)
+	}
+
+	webApp.AddCanonicalSource = func(deviceID, reported, sourceType string) (bool, error) {
+		account, device, err := accountForDevice(ds, deviceID, reported)
+		if err != nil {
+			return false, err
+		}
+
+		return ds.AddCanonicalSource(account, device, sourceType)
+	}
+
+	webApp.AdoptSpeakerPreset = func(deviceID, reported string, preset models.ServicePreset) ([]models.StoredPresetRow, error) {
+		account, device, err := accountForDevice(ds, deviceID, reported)
+		if err != nil {
+			return nil, err
+		}
+
+		return ds.SetStoredPreset(account, device, preset)
+	}
 
 	// A removal from the player UI cascades to the datastore (the single
 	// source of truth), so the device does not reappear on the next re-sync.
@@ -1930,6 +2024,7 @@ func setupRouter(server *handlers.Server, stockholmHandler *stockholm.Handler, w
 			r.Get("/", server.HandleMgmtListAccounts)
 			r.Get("/{accountId}", server.HandleMgmtAccountDetails)
 			r.Post("/{accountId}/language", server.HandleMgmtUpdateAccountLanguage)
+			r.Post("/{accountId}/preset-sync", server.HandleMgmtUpdateAccountPresetSync)
 			r.Post("/{accountId}/provider-settings", server.HandleMgmtUpdateAccountProviderSetting)
 			r.Get("/{accountId}/speakers", server.HandleMgmtListSpeakers)
 		})

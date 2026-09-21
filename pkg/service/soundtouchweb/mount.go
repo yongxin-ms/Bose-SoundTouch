@@ -32,6 +32,12 @@ func (app *WebApp) MountWeb(r chi.Router, discoveryService *discovery.UnifiedDis
 	r.Route("/api/control", func(r chi.Router) {
 		r.Get("/version", app.HandleAPIVersion)
 
+		// What this service has seen stored or played, which is what the
+		// preset editor picks from (issue 754). Service-wide, not
+		// device-scoped: the whole point is that one speaker can be given
+		// what another one had.
+		r.Get("/catalog", app.HandleCatalog)
+
 		// App-wide event stream: device list, discovery status, per-device
 		// status updates. The read/event half of the control surface (the
 		// per-device socket lives at devices/{id}/ws).
@@ -89,6 +95,29 @@ func (app *WebApp) MountWeb(r chi.Router, discoveryService *discovery.UnifiedDis
 				// Low-level "store this ContentItem in a slot" primitive. The
 				// /action/storepreset form stores whatever is playing instead.
 				r.Post("/preset/{slot}", app.HandleStorePresetContent)
+				// Empty a slot. Safe to offer because the catalog keeps the
+				// entry: clearing a slot no longer loses the station.
+				r.Delete("/preset/{slot}", app.HandleRemovePreset)
+
+				// What AfterTouch stores for this speaker, and the repair for
+				// when that disagrees with what the speaker reports. Separate
+				// from preset/{slot} because it addresses the service's own
+				// rows, several of which name no slot at all (issue 697).
+				// What the other speakers have and this one does not. Not
+				// under /library, which is about one kind of source only.
+				// Registered as two literal paths rather than a subrouter:
+				// a subrouter would move the GET to a trailing slash, and
+				// that path is already published.
+				r.Get("/sources-elsewhere", app.HandleSourcesElsewhere)
+				r.Post("/sources-elsewhere/add", app.HandleAddSourceElsewhere)
+
+				r.Route("/stored-presets", func(r chi.Router) {
+					r.Get("/", app.HandleStoredPresets)
+					r.Post("/repair", app.HandleRepairStoredPresets)
+					// Settle one slot by taking what the speaker has, rather
+					// than importing its whole list.
+					r.Post("/adopt", app.HandleAdoptSpeakerPreset)
+				})
 				// Generic key / preset / source / bass actions. Source selection is
 				// canonically POSTed as JSON; its GET form remains temporarily for
 				// compatibility and marks every response as deprecated.
