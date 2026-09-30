@@ -422,7 +422,7 @@ func main() {
 							},
 							&cli.StringFlag{
 								Name:    "service-url",
-								Usage:   "AfterTouch service HTTPS URL (e.g. https://soundtouch.local). Required for LOCAL_INTERNET_RADIO: the speaker's BMX module calls GET on the preset location and expects an Orion JSON response, not raw audio. When provided, the stream URL is automatically wrapped in the Orion station endpoint.",
+								Usage:   "Deprecated, ignored. LOCAL_INTERNET_RADIO stream URLs are wrapped in a relative Orion station location (/station?data=...) that the speaker resolves through its BMX registry, so no service URL is needed. Kept so existing scripts keep working.",
 								EnvVars: []string{"SOUNDTOUCH_SERVICE_URL"},
 							},
 						},
@@ -1034,7 +1034,7 @@ func main() {
 					},
 					{
 						Name:   "custom-radio",
-						Usage:  "Select custom radio stream via soundtouch-service",
+						Usage:  "Select a radio stream through AfterTouch (relative Orion station location)",
 						Action: selectCustomRadio,
 						Before: RequireHost,
 						Flags: []cli.Flag{
@@ -1055,8 +1055,7 @@ func main() {
 							},
 							&cli.StringFlag{
 								Name:  "service-url",
-								Usage: "URL of the soundtouch-service (default: http://localhost:8080)",
-								Value: "http://localhost:8080",
+								Usage: "Ignored (kept for compatibility): the station location is relative and follows the speaker's AfterTouch address",
 							},
 						},
 					},

@@ -72,6 +72,20 @@ type WebApp struct {
 	// client cannot indefinitely block updates for healthy clients.
 	webSocketWriteTimeout time.Duration
 
+	// watchMu guards the browser WebSocket watcher count across both pools
+	// (WSClients and DeviceWSClients) and the status poll it drives: the poll
+	// runs only while watchers > 0 (issue 766). pollStop ends the running
+	// poll; pollDone is closed once it has ended. Always taken after the
+	// pool's own mutex, never before. See status_poll.go.
+	watchMu  sync.Mutex
+	watchers int
+	pollStop chan struct{}
+	pollDone chan struct{}
+	// statusPollInterval and statusCacheTTL override the package defaults
+	// of the same name when positive (tests).
+	statusPollInterval time.Duration
+	statusCacheTTL     time.Duration
+
 	deviceBroadcastMu      sync.Mutex
 	deviceBroadcastPending bool
 	deviceBroadcastRunning bool
@@ -385,8 +399,8 @@ func (app *WebApp) TouchDevice(id string) bool {
 }
 
 // RemoveDevice removes the device registered under id and stops its
-// background goroutines (status poller + WebSocket reconnect loop) via
-// conn.Close. It waits for an in-flight settings operation on the same
+// background work (the WebSocket reconnect loop; the status poll skips it
+// from then on) via conn.Close. It waits for an in-flight settings operation on the same
 // physical device without holding the registry lock. Returns true if id was
 // present. Close runs outside the registry lock because it performs network
 // I/O (WebSocket disconnect).
@@ -482,7 +496,13 @@ func (app *WebApp) removeDeviceIfMatchOrAbsent(
 }
 
 // HandleAPIDevices returns all devices as JSON
+//
+// The list answers from the status cache. Without a browser WebSocket open
+// nothing polls the speakers (issue 766), so stale entries are refreshed
+// first, bounded by statusRefreshWait.
 func (app *WebApp) HandleAPIDevices(w http.ResponseWriter, _ *http.Request) {
+	app.refreshStaleDeviceStatuses(app.DeviceSnapshot())
+
 	w.Header().Set("Content-Type", "application/json")
 
 	// Return all devices as JSON
@@ -1448,6 +1468,28 @@ func (app *WebApp) findIPByHwID(hwID string) string {
 	return ""
 }
 
+// zoneDeviceEntries keeps the registry entries of the zone's master and
+// members, the ones whose cached status the zone view reports.
+func zoneDeviceEntries(entries []DeviceEntry, zone *models.ZoneInfo) []DeviceEntry {
+	if zone == nil {
+		return nil
+	}
+
+	inZone := make([]DeviceEntry, 0, len(zone.Members)+1)
+
+	for _, entry := range entries {
+		if entry.Device == nil || entry.Device.DeviceInfo == nil {
+			continue
+		}
+
+		if deviceID := entry.Device.DeviceInfo.DeviceID; deviceID != "" && zone.IsInZone(deviceID) {
+			inZone = append(inZone, entry)
+		}
+	}
+
+	return inZone
+}
+
 // HandleGetZone returns zone info for a device, enriched with member
 // names and role flags (isMaster / isSlave / isStandalone) computed
 // from the perspective of the queried device.
@@ -1481,6 +1523,10 @@ func (app *WebApp) HandleGetZone(w http.ResponseWriter, r *http.Request) {
 	if device.ApplyPolledZone(zoneGeneration, currentHwID, zone) {
 		app.BroadcastDeviceList()
 	}
+
+	// Member names and connectivity below come from the status cache; bring
+	// it up to date for a caller without a WebSocket (issue 766).
+	app.refreshStaleDeviceStatuses(zoneDeviceEntries(app.DeviceSnapshot(), zone))
 
 	masterIP := app.findIPByHwID(zone.Master)
 
@@ -1959,10 +2005,12 @@ func (app *WebApp) HandleDevicePlay(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// HandlePlayURL plays a custom stream URL on a device. When ServiceURL is
-// configured the stream is wrapped in the Orion location format so the
-// speaker's BMX module receives JSON instead of raw audio bytes. This also
-// ensures that the ★ preset save flow stores a working location.
+// HandlePlayURL plays a custom stream URL on a device. The stream is wrapped
+// in the relative Orion location format ("/station?data=...") so the
+// speaker's BMX module receives JSON instead of raw audio bytes. The speaker
+// resolves the location against the Orion baseUrl from its BMX registry, so
+// no service URL is needed here, and a preset saved from it (the ★ flow)
+// keeps working when AfterTouch changes its address (issue 769).
 func (app *WebApp) HandlePlayURL(w http.ResponseWriter, r *http.Request) {
 	deviceID := chi.URLParam(r, "id")
 
@@ -1977,11 +2025,12 @@ func (app *WebApp) HandlePlayURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Older player pages also send "serviceUrl". It is no longer needed (the
+	// location is relative) and is ignored, like any other unknown field.
 	var req struct {
-		URL        string `json:"url"`
-		Name       string `json:"name"`
-		ImageURL   string `json:"imageUrl"`
-		ServiceURL string `json:"serviceUrl"`
+		URL      string `json:"url"`
+		Name     string `json:"name"`
+		ImageURL string `json:"imageUrl"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1994,22 +2043,7 @@ func (app *WebApp) HandlePlayURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Server-side --service-url wins; fall back to client-supplied value.
-	serviceURL := app.ServiceURL
-	if serviceURL == "" {
-		serviceURL = strings.TrimRight(req.ServiceURL, "/")
-	}
-
-	if serviceURL == "" {
-		app.sendError(w,
-			"AfterTouch service URL is required for LOCAL_INTERNET_RADIO playback. "+
-				"Start soundtouch-player with --service-url <https://your-aftertouch-host> or enter it in the Play URL settings.",
-			http.StatusBadRequest)
-
-		return
-	}
-
-	location := bmxpkg.BuildOrionLocation(serviceURL, req.Name, req.ImageURL, req.URL)
+	location := bmxpkg.BuildOrionLocation(req.Name, req.ImageURL, req.URL)
 
 	contentItem := &models.ContentItem{
 		Source:       "LOCAL_INTERNET_RADIO",

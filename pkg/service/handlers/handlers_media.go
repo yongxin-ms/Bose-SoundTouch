@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
@@ -15,6 +16,25 @@ var indexHTML []byte
 
 //go:embed web/landing.html
 var landingHTML []byte
+
+// landingHTMLPlayerOff is the chooser while the embedded player is disabled
+// (issue 762): the Player entry stays, muted and without a link, and says
+// where to turn it back on. Derived once from landingHTML so the page keeps a
+// single source.
+var landingHTMLPlayerOff = mutePlayerEntry(landingHTML)
+
+const (
+	landingPlayerLink    = `<a class="dest dest--player" href="/app">`
+	landingPlayerLinkOff = `<a class="dest dest--player dest--off" aria-disabled="true">`
+	landingPlayerDesc    = `<span class="desc">Playback, volume, presets, zones, and TuneIn / RadioBrowser.</span>`
+	landingPlayerDescOff = `<span class="desc">Turned off in the admin console's Settings.</span>`
+)
+
+func mutePlayerEntry(page []byte) []byte {
+	out := bytes.Replace(page, []byte(landingPlayerLink), []byte(landingPlayerLinkOff), 1)
+
+	return bytes.Replace(out, []byte(landingPlayerDesc), []byte(landingPlayerDescOff), 1)
+}
 
 //go:embed web/css/* web/js/* web/img/favicon-braille* web/img/favicon*
 var webFS embed.FS
@@ -125,16 +145,26 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 	if !r.URL.Query().Has("chooser") {
 		switch s.defaultLanding() {
 		case "app":
-			http.Redirect(w, r, "/app", http.StatusFound)
-			return
+			// Falls through to the chooser when the player is disabled
+			// (issue 762) instead of redirecting into a route that would
+			// just 404 with the disabled message.
+			if s.PlayerEnabled() {
+				http.Redirect(w, r, "/app", http.StatusFound)
+				return
+			}
 		case "admin":
 			http.Redirect(w, r, "/admin", http.StatusFound)
 			return
 		}
 	}
 
+	page := landingHTML
+	if !s.PlayerEnabled() {
+		page = landingHTMLPlayerOff
+	}
+
 	w.Header().Set("Content-Type", "text/html")
-	_, _ = w.Write(landingHTML)
+	_, _ = w.Write(page)
 }
 
 // HandleAdmin serves the admin / setup console. It used to live at "/";

@@ -19,10 +19,11 @@ import (
 func newTestServiceContext(t *testing.T, args ...string) *cli.Context {
 	t.Helper()
 
-	app := &cli.App{Flags: serviceFlags}
+	flags := copyFlags(t, serviceFlags)
+	app := &cli.App{Flags: flags}
 	set := flag.NewFlagSet("test", flag.ContinueOnError)
 
-	for _, f := range serviceFlags {
+	for _, f := range flags {
 		if err := f.Apply(set); err != nil {
 			t.Fatalf("apply flag %v: %v", f.Names(), err)
 		}
@@ -33,6 +34,38 @@ func newTestServiceContext(t *testing.T, args ...string) *cli.Context {
 	}
 
 	return cli.NewContext(app, set, nil)
+}
+
+// copyFlags returns shallow copies of flags. urfave/cli's Apply writes a
+// value found in the flag's environment variable back into the flag itself
+// (e.g. BoolFlag.Value), so applying the shared serviceFlags in a test that
+// sets PLAYER_ENABLED=false changed the default for every later test run
+// (visible with -count=2 and more).
+func copyFlags(t *testing.T, flags []cli.Flag) []cli.Flag {
+	t.Helper()
+
+	copied := make([]cli.Flag, 0, len(flags))
+
+	for _, f := range flags {
+		switch v := f.(type) {
+		case *cli.BoolFlag:
+			c := *v
+			copied = append(copied, &c)
+		case *cli.StringFlag:
+			c := *v
+			copied = append(copied, &c)
+		case *cli.IntFlag:
+			c := *v
+			copied = append(copied, &c)
+		case *cli.StringSliceFlag:
+			c := *v
+			copied = append(copied, &c)
+		default:
+			t.Fatalf("copyFlags: unhandled flag type %T for %v", f, f.Names())
+		}
+	}
+
+	return copied
 }
 
 func TestResolveFallbackHost(t *testing.T) {
@@ -274,6 +307,88 @@ func TestApplyPersistedSettings(t *testing.T) {
 
 		if config.redact != true {
 			t.Errorf("Expected redact to be true, got false")
+		}
+	})
+
+	// issue 762: an install that predates this setting has no player_enabled
+	// key in settings.json at all, which must not silently disable the
+	// player. Only an explicit persisted value (true or false) should ever
+	// override the CLI/env-derived config.playerEnabled.
+	t.Run("player_enabled: nil (never configured) keeps the CLI/env value", func(t *testing.T) {
+		if err := ds.SaveSettings(datastore.Settings{}); err != nil {
+			t.Fatalf("Failed to save settings: %v", err)
+		}
+
+		config := &serviceConfig{playerEnabled: true}
+		applyPersistedSettings(ds, config)
+
+		if !config.playerEnabled {
+			t.Errorf("nil persisted PlayerEnabled must not disable an install that defaults to enabled")
+		}
+	})
+
+	t.Run("player_enabled: explicit false overrides the CLI/env value", func(t *testing.T) {
+		disabled := false
+		if err := ds.SaveSettings(datastore.Settings{PlayerEnabled: &disabled}); err != nil {
+			t.Fatalf("Failed to save settings: %v", err)
+		}
+
+		config := &serviceConfig{playerEnabled: true}
+		applyPersistedSettings(ds, config)
+
+		if config.playerEnabled {
+			t.Errorf("persisted PlayerEnabled=false must win over the CLI/env default")
+		}
+	})
+
+	t.Run("player_enabled: explicit true overrides the CLI/env value", func(t *testing.T) {
+		enabled := true
+		if err := ds.SaveSettings(datastore.Settings{PlayerEnabled: &enabled}); err != nil {
+			t.Fatalf("Failed to save settings: %v", err)
+		}
+
+		config := &serviceConfig{playerEnabled: false}
+		applyPersistedSettings(ds, config)
+
+		if !config.playerEnabled {
+			t.Errorf("persisted PlayerEnabled=true must win over a CLI/env override")
+		}
+	})
+}
+
+func TestLoadConfigPlayerEnabled(t *testing.T) {
+	t.Run("defaults to enabled", func(t *testing.T) {
+		config, err := loadConfig(newTestServiceContext(t))
+		if err != nil {
+			t.Fatalf("loadConfig: unexpected error: %v", err)
+		}
+
+		if !config.playerEnabled {
+			t.Errorf("playerEnabled: got false, want true (default)")
+		}
+	})
+
+	t.Run("--player-enabled=false disables it", func(t *testing.T) {
+		config, err := loadConfig(newTestServiceContext(t, "--player-enabled=false"))
+		if err != nil {
+			t.Fatalf("loadConfig: unexpected error: %v", err)
+		}
+
+		if config.playerEnabled {
+			t.Errorf("playerEnabled: got true, want false")
+		}
+	})
+
+	t.Run("PLAYER_ENABLED=false env var disables it", func(t *testing.T) {
+		t.Setenv("PLAYER_ENABLED", "false")
+
+		config, err := loadConfig(newTestServiceContext(t))
+		if err != nil {
+			t.Fatalf("loadConfig: unexpected error: %v", err)
+		}
+
+		if config.playerEnabled {
+			t.Errorf("playerEnabled: got true, want false")
 		}
 	})
 }

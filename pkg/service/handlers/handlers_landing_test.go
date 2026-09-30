@@ -76,6 +76,26 @@ func TestHandleRootRedirects(t *testing.T) {
 	}
 }
 
+// TestHandleRootAppLandingFallsBackToChooserWhenPlayerDisabled: default_landing
+// "app" normally redirects to /app, but that route is refused with the
+// disabled message while the player is off (issue 762), so redirecting there
+// would just confuse the operator. Falls back to serving the chooser instead.
+func TestHandleRootAppLandingFallsBackToChooserWhenPlayerDisabled(t *testing.T) {
+	server := newLandingServer(t, "app")
+	server.SetPlayerEnabled(false)
+
+	rec := httptest.NewRecorder()
+	server.HandleRoot(rec, htmlGet("/"))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200 (chooser, not a redirect into a disabled route)", rec.Code)
+	}
+
+	if !strings.Contains(rec.Body.String(), `href="/admin"`) {
+		t.Error("expected the chooser body")
+	}
+}
+
 // TestHandleRootChooserOverride: "?chooser" forces the chooser even when a
 // default redirect is configured, so the hub stays reachable.
 func TestHandleRootChooserOverride(t *testing.T) {
@@ -129,5 +149,42 @@ func TestHandleAdminServesConsole(t *testing.T) {
 
 	if !strings.Contains(rec.Body.String(), "tab-settings") {
 		t.Error("admin body did not contain the console markup")
+	}
+}
+
+// TestHandleRootChooserMutesPlayerWhenDisabled: with the player off
+// (issue 762) the chooser keeps the Player entry, so the page layout stays
+// familiar, but muted and without a link into the refused /app route.
+func TestHandleRootChooserMutesPlayerWhenDisabled(t *testing.T) {
+	server := newLandingServer(t, "")
+
+	rec := httptest.NewRecorder()
+	server.HandleRoot(rec, htmlGet("/"))
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `href="/app"`) || strings.Contains(body, `<a class="dest dest--player dest--off"`) {
+		t.Fatal("player enabled: expected the ordinary Player link")
+	}
+
+	server.SetPlayerEnabled(false)
+
+	rec = httptest.NewRecorder()
+	server.HandleRoot(rec, htmlGet("/"))
+
+	body = rec.Body.String()
+	if strings.Contains(body, `href="/app"`) {
+		t.Error("player disabled: the chooser still links to /app")
+	}
+
+	if !strings.Contains(body, `<a class="dest dest--player dest--off" aria-disabled="true"`) {
+		t.Error("player disabled: expected a muted Player entry")
+	}
+
+	if !strings.Contains(body, "Turned off in the admin console's Settings.") {
+		t.Error("player disabled: expected the entry to say why it is muted")
+	}
+
+	if !strings.Contains(body, `href="/admin"`) {
+		t.Error("player disabled: the admin entry must stay")
 	}
 }

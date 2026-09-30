@@ -128,10 +128,20 @@ type DeviceConnection struct {
 	zoneGeneration        uint64
 	zoneAppliedGeneration uint64
 
+	// statusRefreshMu guards the shared status refresh (issue 766): the one
+	// round in flight that other callers join instead of starting their own,
+	// when the last round ended, and which requests of that round failed, so
+	// a failure is logged when it starts and when it ends rather than on
+	// every round. See BeginSharedStatusRefresh.
+	statusRefreshMu       sync.Mutex
+	statusRefreshInFlight chan struct{}
+	statusRefreshedAt     time.Time
+	statusFailures        string
+
 	// done is closed by Close when the device is removed from the
-	// registry, signalling its background goroutines (the status poller
-	// and the WebSocket reconnect loop) to exit. closeOnce keeps Close
-	// idempotent.
+	// registry, signalling its background goroutines (a status refresh
+	// about to start and the WebSocket reconnect loop) to exit. closeOnce
+	// keeps Close idempotent.
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -344,9 +354,9 @@ func (c *DeviceConnection) Status() *DeviceStatus {
 }
 
 // Done returns a channel that is closed when the connection is removed
-// from the registry. The per-device status poller and WebSocket
-// reconnect loop select on it to stop instead of running for the life
-// of the process.
+// from the registry. The WebSocket reconnect loop selects on it to stop
+// instead of running for the life of the process, and a status refresh
+// is not started for a closed connection.
 func (c *DeviceConnection) Done() <-chan struct{} {
 	return c.done
 }
@@ -596,6 +606,87 @@ func (c *DeviceConnection) UpdateStatus(mut func(*DeviceStatus)) {
 			return
 		}
 	}
+}
+
+// BeginSharedStatusRefresh coordinates full status refreshes so a burst of
+// callers (the watcher poll, several REST requests at once) costs the
+// speaker one round, not one each.
+//
+// It returns a nil channel when the last round ended less than maxAge ago
+// (maxAge <= 0 never counts as fresh): nothing to do. Otherwise it returns a
+// channel that is closed when the round ends. lead reports whether the
+// caller has to run that round itself and then call EndSharedStatusRefresh;
+// when false, a round is already in flight and the caller only waits.
+func (c *DeviceConnection) BeginSharedStatusRefresh(
+	now time.Time,
+	maxAge time.Duration,
+) (done <-chan struct{}, lead bool) {
+	c.statusRefreshMu.Lock()
+	defer c.statusRefreshMu.Unlock()
+
+	if c.statusRefreshInFlight != nil {
+		return c.statusRefreshInFlight, false
+	}
+
+	if maxAge > 0 && !c.statusRefreshedAt.IsZero() && now.Sub(c.statusRefreshedAt) < maxAge {
+		return nil, false
+	}
+
+	c.statusRefreshInFlight = make(chan struct{})
+
+	return c.statusRefreshInFlight, true
+}
+
+// EndSharedStatusRefresh ends the round a lead BeginSharedStatusRefresh
+// started and releases everyone waiting on it.
+func (c *DeviceConnection) EndSharedStatusRefresh() {
+	c.statusRefreshMu.Lock()
+	defer c.statusRefreshMu.Unlock()
+
+	if c.statusRefreshInFlight != nil {
+		close(c.statusRefreshInFlight)
+		c.statusRefreshInFlight = nil
+	}
+}
+
+// MarkStatusRefreshed records that a full status round ended at, whether it
+// went through BeginSharedStatusRefresh or not. A round that failed counts
+// too: the cache is as fresh as the speaker lets it be, and treating it as
+// stale would have every REST request retry an unreachable speaker.
+func (c *DeviceConnection) MarkStatusRefreshed(at time.Time) {
+	c.statusRefreshMu.Lock()
+	defer c.statusRefreshMu.Unlock()
+
+	if at.After(c.statusRefreshedAt) {
+		c.statusRefreshedAt = at
+	}
+}
+
+// StatusRefreshedAt returns when the last full status round ended, or the
+// zero time before the first one.
+func (c *DeviceConnection) StatusRefreshedAt() time.Time {
+	c.statusRefreshMu.Lock()
+	defer c.statusRefreshMu.Unlock()
+
+	return c.statusRefreshedAt
+}
+
+// ObserveStatusFailures records which requests of a status round failed,
+// as a canonical description ("" when none did), and reports whether that
+// differs from the previous round. It lets the caller log a failure when it
+// starts and when it clears, not on every round of a speaker that stays
+// offline.
+func (c *DeviceConnection) ObserveStatusFailures(failures string) bool {
+	c.statusRefreshMu.Lock()
+	defer c.statusRefreshMu.Unlock()
+
+	if failures == c.statusFailures {
+		return false
+	}
+
+	c.statusFailures = failures
+
+	return true
 }
 
 // BeginHTTPPoll reserves an ordering generation for a status poll.

@@ -46,12 +46,15 @@ type Server struct {
 	httpsPort                string // configured HTTPS port, used when deriving
 	httpsDefaultURL          string // startup hostname-based fallback when serverURL has no host
 	httpsListenAddr          string
+	httpListenAddr           string
 	discovering              bool
 	redactLogs               bool
 	logBodies                bool
 	recordEnabled            bool
 	discoveryInterval        time.Duration
 	discoveryEnabled         bool
+	playerEnabled            bool // live embedded-player opt-out; defaults on (issue 762)
+	playerEnabledChangedHook func(enabled bool)
 	updateCheckInterval      time.Duration // live update-check interval; see SetUpdateCheckSettings
 	updateCheckEnabled       bool          // live update-check opt-in; defaults off (#591)
 	dnsEnabled               bool
@@ -143,6 +146,9 @@ func NewServer(ds *datastore.DataStore, sm *setup.Manager, serverURL string, red
 		recordEnabled:     recordEnabled,
 		discoveryInterval: 5 * time.Minute,
 		discoveryEnabled:  true,
+		// The embedded player is on by default (issue 762): existing installs
+		// must see no change unless an operator explicitly opts out.
+		playerEnabled: true,
 		// The update check is opt-in (#591): only the interval gets a default,
 		// updateCheckEnabled stays false so no install starts making outbound
 		// GitHub calls without an explicit yes.
@@ -180,7 +186,19 @@ func NewServer(ds *datastore.DataStore, sm *setup.Manager, serverURL string, red
 		serverURL, _ := s.GetSettings()
 		return serverURL
 	})
-	health.RegisterOrionPathsCheck(s.healthRegistry, ds)
+	health.RegisterOrionPathsCheck(s.healthRegistry, ds, health.OrionPathsDeps{
+		ServiceURLs:   s.GetSettings,
+		ListenPorts:   s.listenPorts,
+		ExpectedHosts: s.ExpectedHosts,
+		DNSEnabled:    s.DNSHijackEnabled,
+		DNSClientIPs: func() map[string]time.Time {
+			if s.dnsDiscovery == nil {
+				return map[string]time.Time{}
+			}
+
+			return s.dnsDiscovery.InterceptClientIPs()
+		},
+	})
 	health.RegisterPresetsCountCheck(s.healthRegistry, ds)
 	health.RegisterPresetsConsistencyCheck(s.healthRegistry, ds)
 	health.RegisterRefreshSourcesCheck(s.healthRegistry, ds)
@@ -293,44 +311,72 @@ func NewServer(ds *datastore.DataStore, sm *setup.Manager, serverURL string, red
 		},
 	)
 
-	// QuickFix executor for the dns_speaker_usage per-device info findings.
-	// Lives here (not in the health package) because it needs runDNSPathProbe,
-	// which is part of the handlers layer. The health package deliberately
-	// avoids importing handlers to keep its transitive dep surface small.
+	health.RegisterDNSBypassRiskCheck(
+		s.healthRegistry,
+		s.ds,
+		s.DNSHijackEnabled,
+		func() string {
+			serverURL, _ := s.GetSettings()
+
+			ip, err := s.ResolveServerURLIPForPreflight(serverURL)
+			if err != nil {
+				return ""
+			}
+
+			return ip
+		},
+		func() map[string]time.Time {
+			if s.dnsDiscovery == nil {
+				return map[string]time.Time{}
+			}
+
+			return s.dnsDiscovery.InterceptClientIPs()
+		},
+		s.readSpeakerDNSResolution,
+	)
+
+	// QuickFix executor for the dns_speaker_usage / dns_bypass_risk per-device
+	// info findings. Lives here (not in the health package) because it needs
+	// runDNSPathProbe, which is part of the handlers layer. The health package
+	// deliberately avoids importing handlers to keep its transitive dep
+	// surface small.
 	//
 	// Registered without refresh: this probe is a diagnostic whose value is the
 	// result message ("DNS path OK" / "no callback ..."). A refresh would re-fetch
 	// the whole health list and wipe that message from the UI before the operator
 	// can read it. The operator can refresh manually to see a now-confirmed
 	// speaker drop its finding.
-	s.healthRegistry.RegisterFixNoRefresh(
-		health.CheckIDDNSSpeakerUsage,
-		"probe_dns_path",
-		func(target health.Target) (string, error) {
-			res, err := s.runDNSPathProbe(target.Device, "")
-			if err != nil {
-				return "", err
-			}
-
-			if res.Success {
-				return fmt.Sprintf(
-					"Speaker resolved a Bose hostname through AfterTouch in %.0fms. DNS path OK.",
-					res.LatencyMs,
-				), nil
-			}
-
-			msg := "No /v1/auth callback within the timeout; this speaker likely resolves Bose hostnames via a different DNS resolver."
-			if res.Remediation != "" {
-				msg += " " + res.Remediation
-			}
-
-			return msg, nil
-		},
-	)
+	s.healthRegistry.RegisterFixNoRefresh(health.CheckIDDNSSpeakerUsage, "probe_dns_path", s.probeDNSPathFix)
+	s.healthRegistry.RegisterFixNoRefresh(health.CheckIDDNSBypassRisk, "probe_dns_path", s.probeDNSPathFix)
 
 	s.dismissedAnnouncements = loadDismissedAnnouncements(ds)
 
 	return s
+}
+
+// probeDNSPathFix is the shared probe_dns_path QuickFix executor for both
+// dns_speaker_usage and dns_bypass_risk: it runs an active DNS-path probe on
+// the target device and reports whether the speaker resolved a Bose
+// hostname through AfterTouch.
+func (s *Server) probeDNSPathFix(target health.Target) (string, error) {
+	res, err := s.runDNSPathProbe(target.Device, "")
+	if err != nil {
+		return "", err
+	}
+
+	if res.Success {
+		return fmt.Sprintf(
+			"Speaker resolved a Bose hostname through AfterTouch in %.0fms. DNS path OK.",
+			res.LatencyMs,
+		), nil
+	}
+
+	msg := "No /v1/auth callback within the timeout; this speaker likely resolves Bose hostnames via a different DNS resolver."
+	if res.Remediation != "" {
+		msg += " " + res.Remediation
+	}
+
+	return msg, nil
 }
 
 // clockSetTolerance is how close the speaker's clock must be to the target
@@ -609,6 +655,52 @@ func (s *Server) GetUpdateCheckSettings() (time.Duration, bool) {
 	defer s.mu.RUnlock()
 
 	return s.updateCheckInterval, s.updateCheckEnabled
+}
+
+// PlayerEnabled reports whether the embedded player (soundtouch-player at
+// /app and its /api/control API) is currently enabled. Live-readable so the
+// router's PlayerGateMiddleware and the embedded build's background device
+// polling can react to a Settings-page toggle without a restart (issue 762).
+func (s *Server) PlayerEnabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.playerEnabled
+}
+
+// SetPlayerEnabled sets the live player-enabled flag. Called once at startup
+// from the persisted/CLI-derived config; HandleUpdateSettings calls it again
+// whenever the Settings-page toggle changes. Does not itself fire
+// playerEnabledChangedHook -- see notifyPlayerEnabledChanged.
+func (s *Server) SetPlayerEnabled(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.playerEnabled = enabled
+}
+
+// SetPlayerEnabledChangedHook registers a callback fired when the live
+// player-enabled flag actually changes value (not on every settings save).
+// The embedded build uses this to start or stop the player's background
+// device polling -- status poll, balance watch, discovery seeding -- without
+// restarting the process (issue 762). Nil-safe.
+func (s *Server) SetPlayerEnabledChangedHook(hook func(enabled bool)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.playerEnabledChangedHook = hook
+}
+
+// notifyPlayerEnabledChanged fires the player-enabled-changed hook, if one is
+// registered.
+func (s *Server) notifyPlayerEnabledChanged(enabled bool) {
+	s.mu.RLock()
+	hook := s.playerEnabledChangedHook
+	s.mu.RUnlock()
+
+	if hook != nil {
+		hook(enabled)
+	}
 }
 
 // SetDevicesChangedHook registers a callback fired after the known device set
@@ -919,6 +1011,16 @@ func (s *Server) SetHTTPSListenAddr(addr string) {
 	s.httpsListenAddr = addr
 }
 
+// SetHTTPListenAddr records the address the plain HTTP listener is bound
+// to, so checks can recognise a URL on that port as this service even when
+// SERVER_URL names only the HTTPS side.
+func (s *Server) SetHTTPListenAddr(addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.httpListenAddr = addr
+}
+
 // actualHTTPSPort returns the port the HTTPS listener is bound to, or
 // "" if unknown/unparseable.
 func (s *Server) actualHTTPSPort() string {
@@ -926,6 +1028,33 @@ func (s *Server) actualHTTPSPort() string {
 	addr := s.httpsListenAddr
 	s.mu.RUnlock()
 
+	return listenPort(addr)
+}
+
+// actualHTTPPort returns the port the plain HTTP listener is bound to, or
+// "" if unknown/unparseable.
+func (s *Server) actualHTTPPort() string {
+	s.mu.RLock()
+	addr := s.httpListenAddr
+	s.mu.RUnlock()
+
+	return listenPort(addr)
+}
+
+// listenPorts returns the known ports of the HTTP and HTTPS listeners.
+func (s *Server) listenPorts() []string {
+	var ports []string
+
+	for _, p := range []string{s.actualHTTPPort(), s.actualHTTPSPort()} {
+		if p != "" {
+			ports = append(ports, p)
+		}
+	}
+
+	return ports
+}
+
+func listenPort(addr string) string {
 	if addr == "" {
 		return ""
 	}

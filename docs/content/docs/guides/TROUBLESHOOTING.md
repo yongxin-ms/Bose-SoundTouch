@@ -657,6 +657,66 @@ soundtouch-cli --host <speaker-ip> setup inspect --telnet
 
 This also applies to a freshly-fixed on-device default (see `DEPLOYMENT_MODE`, #546): the installer now gets the *default* right for new installs automatically, but an install that was already migrated before you updated still needs the explicit re-migrate above — the fix only stops a *new* bad value from being written, it doesn't retroactively correct an already-migrated speaker.
 
+### ❌ Play URL radio presets stop playing after moving AfterTouch to a new host {#play-url-presets-after-move}
+
+**Symptoms:**
+
+- AfterTouch was moved to a new machine (or its address otherwise changed),
+  following [Moving AfterTouch to Another Host](MOVING-HOSTS.md).
+- TuneIn and Radio Browser presets still work.
+- Presets created with the player's **Play URL** feature, or with
+  `soundtouch-cli preset`, no longer play.
+
+- The Health tab warns that Internet Radio presets "point at `<old-host>`, not
+  at this service's address".
+
+**Cause:**
+
+Play URL presets saved by older versions store the full AfterTouch address
+inside the preset's location, for example
+`http://<old-host>:8000/core02/svc-bmx-adapter-orion/prod/orion/station?data=...`.
+When the service's address changes, those presets still point at the old
+address. TuneIn and Radio Browser presets store a relative location that the
+speaker completes with the address from its service registry, so they're
+unaffected by an address change.
+
+Since the fix for
+[issue 769](https://github.com/gesellix/Bose-SoundTouch/issues/769) (next
+release), Play URL and `soundtouch-cli preset` store Internet Radio stations
+the same way, as `/station?data=...`. The speaker resolves that against the
+Orion address in its service registry (verified on a SoundTouch 10, see
+[Player source behaviour](../reference/PLAYER-SOURCE-BEHAVIOUR.md#orion-station-locations)).
+
+**Fix:**
+
+1. Make sure the speaker is re-migrated to the new address (see
+   [Changing Target Domain doesn't change what a speaker actually uses](TROUBLESHOOTING.md#settings-vs-migrate)),
+   so its service registry points at the new host.
+2. Open the **Health** tab. The check "Internet Radio presets use relative
+   station locations" lists each speaker with affected slots. Click **Store
+   as relative locations**: AfterTouch reads the slots from the speaker and
+   stores each one again with the relative location (same name, artwork and
+   slot). The speaker reports the change back to AfterTouch.
+3. If AfterTouch can't reach the speaker, nothing is changed. The finding
+   lists one `curl ... /storePreset` command per slot; run them from a
+   machine that reaches the speaker on port 8090.
+
+Re-saving a preset from the player's **Play URL** also works.
+
+The same check reports a few related cases:
+
+- **Presets that point at this service's current address** (info): they play
+  today, but would break on the next address change. The same fix applies.
+- **Presets that point at `content.api.bose.io`** (saved before the Bose
+  shutdown): they play only while the speaker resolves Bose hostnames through
+  AfterTouch's DNS. With DNS Discovery off that is a warning (they reach the
+  dead Bose cloud); with DNS Discovery on it is an info finding that says
+  whether the speaker has been seen using AfterTouch's DNS. See
+  [TuneIn fails with BMX_HTTP_ERROR 4501 while DNS Discovery is on](TROUBLESHOOTING.md#tunein-4501-dns)
+  if it doesn't.
+- A preset that points at another Orion-compatible service on purpose is
+  reported as well; leave it alone if that is what you want.
+
 ### ❌ Radio sources never activate after an in-place migration {#radio-sources-after-migration}
 
 **Symptoms:**
@@ -684,7 +744,7 @@ Then reboot the speaker (or use "Refresh sources"). Afterwards the Migration tab
 Notes:
 
 - This needs the speaker's telnet diagnostic port (`17000`) to be reachable. Most SoundTouch models expose it; some hardened firmware builds do not, in which case use the factory-reset fallback below.
-- It writes AfterTouch's address (`http://<aftertouch-host>:8000`) **straight onto the speaker**, so there is no `bose:8000` hostname for the speaker to resolve. That is why pointing the service at `http://bose:8000` and adding a `bose` entry to your server's `/etc/hosts` does **not** help: the speaker is a separate device and never reads that file. If you prefer to redirect in the network instead of writing on the device, enable AfterTouch's built-in DNS (Settings) and have the speaker use AfterTouch as its resolver — see the FRITZ!Box + AdGuard guide.
+- It writes AfterTouch's address (`http://<aftertouch-host>:8000`) **straight onto the speaker**, so there is no `bose:8000` hostname for the speaker to resolve. That is why pointing the service at `http://bose:8000` and adding a `bose` entry to your server's `/etc/hosts` does **not** help: the speaker is a separate device and never reads that file. If you prefer to redirect in the network instead of writing on the device, enable AfterTouch's built-in DNS (Settings) and have the speaker use AfterTouch as its resolver, see the FRITZ!Box + AdGuard guide. If you go this route, make sure the speaker actually resolves through AfterTouch afterward, see [TuneIn fails with BMX_HTTP_ERROR 4501 while DNS Discovery is on](TROUBLESHOOTING.md#tunein-4501-dns) for the failure mode when it doesn't.
 - Get `soundtouch-cli` from the [Downloads page](../downloads/_index.md) if you don't already have it.
 
 **Workaround (fallback — factory reset):**
@@ -697,6 +757,53 @@ If the telnet method isn't available for your model, factory reset the speaker, 
 3. Re-migrate it in AfterTouch.
 
 After this the radio sources activate normally. Note the factory reset rewrites the speaker's `Sources.xml` to defaults, so any **account-bound** source (for example a music-streaming login) has to be re-added afterwards; your presets for it come back once the source is present again.
+
+### ❌ TuneIn fails with BMX_HTTP_ERROR 4501 while DNS Discovery is on {#tunein-4501-dns}
+
+**Symptoms:**
+
+- TuneIn (or Internet Radio in general) fails to play; the speaker's own log (`logread` over SSH/telnet) shows `BMX_HTTP_ERROR 4501` for the failing request.
+- The response body behind that error, if you capture it, is an Apigee `ApplicationNotFound` 404. This means the speaker reached the real Bose cloud (Apigee), which was shut down, not AfterTouch.
+- Settings shows **"Enable DNS Discovery Server"** turned on.
+
+**Cause:**
+
+`HandleBMXRegistry` hands out `https://content.api.bose.io` as the base URL for TuneIn and the other BMX-delivered services whenever DNS Discovery is enabled. It assumes every speaker resolves Bose hostnames through AfterTouch's own DNS server. A speaker that was never actually DNS-migrated (no AfterTouch nameserver in its `/etc/resolv.conf`, no `aftertouch.resolv.conf` hook installed) still gets handed that cloud URL, reaches the dead Apigee endpoint, and fails with 4501. This is exactly what happened in [issue #728](https://github.com/gesellix/Bose-SoundTouch/issues/728).
+
+**Diagnose:**
+
+1. Check Settings → is **"Enable DNS Discovery Server"** on?
+2. Check the Health tab for the **dns_bypass_risk** check. A warning there means AfterTouch has positive SSH evidence (via the speaker's own `/etc/resolv.conf`) that this speaker isn't resolving through it. An info-level finding (or the related **dns_speaker_usage** check) means it's unconfirmed either way, the speaker may simply not have queried an intercepted hostname yet, not necessarily be bypassing DNS.
+3. If you have SSH access to the speaker, confirm directly:
+   ```bash
+   ssh root@<speaker-ip>
+   cat /etc/resolv.conf
+   ls -la /mnt/nv/soundtouch-service/aftertouch.resolv.conf /mnt/nv/aftertouch.resolv.conf
+   ```
+   No AfterTouch nameserver and no hook file present means this speaker is not DNS-migrated.
+4. `logread` on the speaker (or a diagnostic export) confirms the 4501 / Apigee signature described above.
+
+**Fix: pick ONE way out, don't toggle back and forth:**
+
+- **Turn DNS Discovery off** in Settings, if you don't actually want DNS-based redirection for this speaker (or any speaker on this network). This is the simplest fix when you only migrated via telnet/XML/hosts and never intended to rely on DNS.
+- **Or** DNS-migrate this speaker, so it actually gets the AfterTouch nameserver and hook file:
+  ```bash
+  soundtouch-cli --host <speaker-ip> setup migrate --method resolv --service-url http://<aftertouch-host>:8000
+  ```
+
+Switching between these repeatedly on the same speaker without rebooting in between is how a reporter on #728 ended up in a confusing mixed state (TuneIn playing but `recent_mismatch` warnings growing, and TuneIn stations misreported as `INTERNET_RADIO`). Pick one and stick with it.
+
+**Reboot required:**
+
+Whichever fix you pick, reboot the speaker afterward. It keeps its old BMX service list, including whatever base URL it already fetched, until it restarts and re-fetches the registry.
+
+**Verify:**
+
+1. Play a TuneIn station.
+2. Check the Health tab. `dns_bypass_risk` / `dns_speaker_usage` should drop their finding for this device once it's confirmed using AfterTouch's DNS (or once DNS Discovery is off, `dns_bypass_risk` has nothing to say at all).
+3. A `recent_mismatch` warning can show up briefly right after the fix, while the service catches up on the speaker's latest `/recents` notification. This is not itself evidence the DNS fix failed. Give it a little time (and a manual health refresh) rather than immediately changing more settings.
+
+See also [Radio sources never activate after an in-place migration](TROUBLESHOOTING.md#radio-sources-after-migration) for the non-DNS variant of the same underlying mechanism (a stale `bmxRegistryUrl`), and [Changing Target Domain in Settings doesn't change what a speaker actually uses](TROUBLESHOOTING.md#settings-vs-migrate) for why a Settings change alone never reaches an already-migrated speaker.
 
 ### ❌ `setup enable-ssh` (or a telnet command) fails right after a power-cycle, but works if you wait
 

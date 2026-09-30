@@ -304,6 +304,15 @@ var serviceFlags = []cli.Flag{
 		Value:   "5m",
 		EnvVars: []string{"DISCOVERY_INTERVAL"},
 	},
+	&cli.BoolFlag{
+		Name: "player-enabled",
+		Usage: "Enable the embedded player (soundtouch-player at /app, plus its /api/control API) and the " +
+			"background device polling it runs. Disable on installs that run AfterTouch on the speaker " +
+			"itself alongside a separate player, to avoid the extra resource cost (issue 762). Also " +
+			"available as a Settings-page toggle, which applies without a restart.",
+		Value:   true,
+		EnvVars: []string{"PLAYER_ENABLED"},
+	},
 	&cli.StringFlag{
 		Name:    "device-seed-retry-interval",
 		Usage:   "Interval between embedded-player startup retries for unreachable persisted devices",
@@ -570,11 +579,13 @@ func main() {
 			server := handlers.NewServer(ds, sm, config.serverURL, config.redact, config.logBody, config.record)
 			sm.GetDNSRunning = server.GetDNSRunning
 			server.SetLogBuffer(logBuf)
+			server.SetHTTPListenAddr(config.addr)
 			server.SetHTTPSListenAddr(config.httpsAddr)
 			server.SetHTTPSSettings(config.httpsOverride, config.httpsPort, config.httpsDefaultURL)
 			server.SetExpectedHosts(config.domains)
 			server.SetVersionInfo(version, commit, date, repoURL)
 			server.SetDiscoverySettings(config.discoveryInterval, config.discoveryEnabled)
+			server.SetPlayerEnabled(config.playerEnabled)
 			server.SetUpdateCheckSettings(config.updateCheckInterval, config.updateCheckEnabled)
 			server.SetDNSSettings(persisted.DNSEnabled, strings.Join(persisted.DNSUpstream, ","), persisted.DNSBindAddr)
 			server.SetInternalPaths(persisted.InternalPaths)
@@ -761,6 +772,7 @@ type serviceConfig struct {
 	tlsExtraHosts           []string
 	discoveryEnabled        bool
 	discoveryInterval       time.Duration
+	playerEnabled           bool
 	deviceSeedRetryInterval time.Duration
 	deviceSeedRetryWindow   time.Duration
 	updateCheckEnabled      bool
@@ -887,6 +899,8 @@ func loadConfig(c *cli.Context) (serviceConfig, error) {
 		discoveryInterval = 5 * time.Minute
 	}
 
+	playerEnabled := c.Bool("player-enabled")
+
 	deviceSeedRetryIntervalStr := c.String("device-seed-retry-interval")
 
 	deviceSeedRetryInterval, err := time.ParseDuration(deviceSeedRetryIntervalStr)
@@ -964,6 +978,7 @@ func loadConfig(c *cli.Context) (serviceConfig, error) {
 		tlsExtraHosts:           tlsExtraHosts,
 		discoveryEnabled:        discoveryEnabled,
 		discoveryInterval:       discoveryInterval,
+		playerEnabled:           playerEnabled,
 		deviceSeedRetryInterval: deviceSeedRetryInterval,
 		deviceSeedRetryWindow:   deviceSeedRetryWindow,
 		updateCheckEnabled:      updateCheckEnabled,
@@ -1131,6 +1146,16 @@ func applyPersistedSettings(ds *datastore.DataStore, config *serviceConfig) data
 		}
 	}
 
+	// nil means "never configured" (e.g. an install that predates issue 762),
+	// which keeps the CLI/env value (default: enabled) rather than silently
+	// switching the player off. Once the Settings page saves this at least
+	// once, the persisted value always wins on later restarts, the same rule
+	// as every other Settings-page field. From then on PLAYER_ENABLED has no
+	// effect (issue 744 is about how that precedence is presented).
+	if persisted.PlayerEnabled != nil {
+		config.playerEnabled = *persisted.PlayerEnabled
+	}
+
 	config.redact = persisted.RedactLogs
 	config.logBody = persisted.LogBodies
 	config.record = persisted.RecordInteractions
@@ -1248,6 +1273,10 @@ func createDefaultSettings(ds *datastore.DataStore, config serviceConfig) datast
 		RecordInteractions: config.record,
 		DiscoveryEnabled:   config.discoveryEnabled,
 		DiscoveryInterval:  config.discoveryInterval.String(),
+		// Seed from the CLI/env flag so a fresh install's settings.json
+		// matches what the operator asked for and the Settings page shows it
+		// (issue 762).
+		PlayerEnabled: &config.playerEnabled,
 		// Seed the update-check preference from the CLI/env flags so a fresh
 		// install's settings.json matches what the operator asked for (and so
 		// the Settings page shows it) instead of silently reverting to off.
@@ -1505,8 +1534,7 @@ func runUpdateCheckTick(checker *updatecheck.Checker, lastLoggedVersion string) 
 
 // newEmbeddedWebApp builds the soundtouch-player application for embedding in the
 // service router: release metadata from the build vars, the service's public
-// ServiceURL (used by Play URL for speaker-fetched stream URLs and shown in the
-// UI), a loopback InternalServiceURL for the player's own server-side self-calls
+// ServiceURL (shown in the UI, for example on the TTS page), a loopback InternalServiceURL for the player's own server-side self-calls
 // (the TTS proxy) so they never depend on TLS or the service CA, and device
 // state sourced entirely from the service.
 //
@@ -1528,8 +1556,9 @@ func newEmbeddedWebApp(server *handlers.Server, serverURL, internalURL string, d
 	// public ServiceURL. That avoids the "service doesn't trust its own CA"
 	// x509 failure entirely: loopback is plain HTTP, so it needs no CA and
 	// works on HTTP and HTTPS deployments alike — and before the CA is even
-	// generated. ServiceURL stays the public URL because Play URL bakes it into
-	// stream URLs the speaker fetches and the UI displays it.
+	// generated. ServiceURL stays the public URL because the UI displays it.
+	// (Play URL used to bake it into the station location; it builds a
+	// relative location now, issue 769.)
 	webApp.InternalServiceURL = internalURL
 
 	webApp.ExtraDeviceHosts = func() ([]string, error) {
@@ -1643,16 +1672,23 @@ func newEmbeddedWebApp(server *handlers.Server, serverURL, internalURL string, d
 	webApp.SetStereoPairGenerationPersistence(cleanup, preflight, rename)
 
 	// Keep the UI registry live as the service discovers or devices are added.
-	server.SetDevicesChangedHook(func() {
-		webApp.SeedExtraDevices()
-		webApp.BroadcastDeviceList()
-	})
+	server.SetDevicesChangedHook(playerDevicesChangedHook(server, webApp))
+
+	// React live to the Settings-page player_enabled toggle (issue 762), no
+	// restart required.
+	server.SetPlayerEnabledChangedHook(playerEnabledChangedHook(webApp))
 
 	go func() {
 		// Project the current device set into the UI. During gateway boot the
 		// service can start before persisted speaker addresses are routable, so
 		// retry only those known addresses for a bounded startup window. The
 		// devices-changed hook and explicit discovery keep it current afterwards.
+		// Skipped entirely when the player starts out disabled (issue 762): no
+		// seeding at all, not even the bounded startup retry.
+		if !server.PlayerEnabled() {
+			return
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), deviceSeedRetryWindow)
 		defer cancel()
 
@@ -1667,6 +1703,45 @@ func newEmbeddedWebApp(server *handlers.Server, serverURL, internalURL string, d
 	}()
 
 	return webApp
+}
+
+// playerDevicesChangedHook re-syncs the embedded player's device registry
+// from the service's own device set (a discovery sweep or a manual add),
+// but only while the player is enabled (issue 762): re-seeding while it is
+// switched off would silently restart the background device work (initial
+// status read, balance watch, and the status poll while a page is open) the
+// operator just turned off.
+func playerDevicesChangedHook(server *handlers.Server, webApp *soundtouchweb.WebApp) func() {
+	return func() {
+		if !server.PlayerEnabled() {
+			return
+		}
+
+		webApp.SeedExtraDevices()
+		webApp.BroadcastDeviceList()
+	}
+}
+
+// playerEnabledChangedHook reacts live to the Settings-page player_enabled
+// toggle (issue 762), no restart required: turning it off stops every
+// per-device goroutine the player started, via RemoveDevice, which closes
+// each connection's Done() channel cleanly; turning it back on reseeds from
+// the service's own device set.
+func playerEnabledChangedHook(webApp *soundtouchweb.WebApp) func(enabled bool) {
+	return func(enabled bool) {
+		if enabled {
+			webApp.SeedExtraDevices()
+			webApp.BroadcastDeviceList()
+
+			return
+		}
+
+		for _, entry := range webApp.DeviceSnapshot() {
+			webApp.RemoveDevice(entry.ID)
+		}
+
+		webApp.BroadcastDeviceList()
+	}
 }
 
 func embeddedStereoPairGenerationPersistence(
@@ -2186,8 +2261,14 @@ func setupRouter(server *handlers.Server, stockholmHandler *stockholm.Handler, w
 	// service's own /, /health, or /static. The web app shares the service's
 	// discovery (nil discovery service here), so it runs no mDNS of its own.
 	// Skipped when nil, e.g. unit tests that only exercise the service surface.
+	// Always mounted (rather than left out when player_enabled is off) so a
+	// Settings-page toggle can gate it live via PlayerGateMiddleware, without
+	// a restart -- see issue 762.
 	if webApp != nil {
-		webApp.MountWeb(r, nil)
+		r.Group(func(r chi.Router) {
+			r.Use(server.PlayerGateMiddleware)
+			webApp.MountWeb(r, nil)
+		})
 	}
 
 	if stockholmHandler != nil {

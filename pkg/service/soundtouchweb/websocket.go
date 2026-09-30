@@ -169,6 +169,7 @@ func (app *WebApp) removeGlobalWebSocketClient(client *websocket.Conn) {
 	mu, ok := app.WSClients[client]
 	if ok {
 		delete(app.WSClients, client)
+		app.watcherLeftLocked()
 	}
 	app.WSMutex.Unlock()
 
@@ -191,6 +192,10 @@ func (app *WebApp) registerGlobalWebSocket(conn *websocket.Conn) error {
 	defer connMu.Unlock()
 
 	app.WSMutex.Lock()
+	if _, known := app.WSClients[conn]; !known {
+		app.watcherJoinedLocked()
+	}
+
 	app.WSClients[conn] = connMu
 	app.WSMutex.Unlock()
 
@@ -502,6 +507,10 @@ func (app *WebApp) applyBalanceEvent(
 // callers install the lock before their first write.
 func (app *WebApp) registerDeviceWebSocketClient(conn webSocketWriter) {
 	app.DeviceWSMutex.Lock()
+	if _, known := app.DeviceWSClients[conn]; !known {
+		app.watcherJoinedLocked()
+	}
+
 	app.DeviceWSClients[conn] = &sync.Mutex{}
 	app.DeviceWSMutex.Unlock()
 }
@@ -512,7 +521,10 @@ func (app *WebApp) registerDeviceWebSocketClient(conn webSocketWriter) {
 // only needs to drop the registry entry.
 func (app *WebApp) removeDeviceWebSocketClient(conn webSocketWriter) {
 	app.DeviceWSMutex.Lock()
-	delete(app.DeviceWSClients, conn)
+	if _, known := app.DeviceWSClients[conn]; known {
+		delete(app.DeviceWSClients, conn)
+		app.watcherLeftLocked()
+	}
 	app.DeviceWSMutex.Unlock()
 }
 
@@ -680,6 +692,13 @@ func (app *WebApp) HandleAPIDiscover(w http.ResponseWriter, r *http.Request) {
 // It deliberately takes no context: it outlives any request, and the
 // connection's own lifetime (conn.Done) is the scope that matters. Work it
 // starts derives its context from that rather than inheriting a caller's.
+//
+// It also outlives the browsers that caused it to open. Unlike the status
+// poll (issue 766), it is left running when nobody watches: an established
+// speaker WebSocket costs one idle connection and no requests, its events
+// keep the cache correct for REST clients in between refreshes (zoneUpdated
+// even triggers its own authoritative refresh), and closing it would need a
+// reopen path that loses whatever the speaker reports in between.
 func (app *WebApp) ConnectDeviceWebSocket(deviceID string, conn *webtypes.DeviceConnection) {
 	// Skip WebSocket connection if client is not available (e.g., in tests)
 	if conn.Client == nil {
@@ -987,11 +1006,13 @@ func (app *WebApp) refreshDeviceStatusAfterStereoPairMutation(deviceID string, c
 	app.updateDeviceStatus(deviceID, conn, &groupBaseline)
 }
 
-func (app *WebApp) updateDeviceStatus(_ string, conn *webtypes.DeviceConnection, groupBaseline *uint64) {
+func (app *WebApp) updateDeviceStatus(deviceID string, conn *webtypes.DeviceConnection, groupBaseline *uint64) {
 	// Skip status update if client is not available (e.g., in tests)
 	if conn.Client == nil {
 		return
 	}
+
+	defer func() { conn.MarkStatusRefreshed(time.Now()) }()
 
 	nowPlayingGen := conn.BeginFieldPoll(webtypes.FieldNowPlaying)
 	volumeGen := conn.BeginFieldPoll(webtypes.FieldVolume)
@@ -1033,6 +1054,17 @@ func (app *WebApp) updateDeviceStatus(_ string, conn *webtypes.DeviceConnection,
 	if stereoCapable {
 		group, groupErr = conn.Client.GetGroup()
 	}
+
+	logStatusFailures(deviceID, conn, []statusRequestResult{
+		{"now_playing", nowPlayingErr},
+		{"name", nameErr},
+		{"volume", volumeErr},
+		{"presets", presetsErr},
+		{"sources", sourcesErr},
+		{"bass", bassErr},
+		{"getZone", zoneErr},
+		{"getGroup", groupErr},
+	})
 
 	// Phase 2: fast, independently-ordered merges. Each field applies only
 	// if this round's fetch succeeded AND no newer poll or push event has
@@ -1124,6 +1156,49 @@ func (app *WebApp) updateDeviceStatus(_ string, conn *webtypes.DeviceConnection,
 		conn.ApplyPolledZone(zoneGeneration, conn.DeviceInfo.DeviceID, zone) {
 		app.BroadcastDeviceList()
 	}
+}
+
+// statusRequestResult is the outcome of one request of a status round.
+type statusRequestResult struct {
+	request string
+	err     error
+}
+
+// logStatusFailures logs the requests of a status round that failed, but
+// only when the set of failing requests changes: once when a speaker stops
+// answering (or one endpoint starts failing), once when it recovers. A
+// speaker that stays offline would otherwise add a line to the log on every
+// round.
+func logStatusFailures(deviceID string, conn *webtypes.DeviceConnection, results []statusRequestResult) {
+	var (
+		failed   []string
+		firstErr error
+	)
+
+	for _, result := range results {
+		if result.err == nil {
+			continue
+		}
+
+		failed = append(failed, result.request)
+		if firstErr == nil {
+			firstErr = result.err
+		}
+	}
+
+	failures := strings.Join(failed, ", ")
+	if !conn.ObserveStatusFailures(failures) {
+		return
+	}
+
+	if failures == "" {
+		log.Printf("Status requests to %s succeed again", sanitizeLog(deviceID))
+
+		return
+	}
+
+	log.Printf("Status requests to %s failed: %s (first error: %s); not logged again until this changes",
+		sanitizeLog(deviceID), failures, sanitizeLog(firstErr.Error()))
 }
 
 func (app *WebApp) applyGroupUpdatedEvent(
