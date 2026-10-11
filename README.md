@@ -116,6 +116,12 @@ See the [API Reference](https://gesellix.github.io/Bose-SoundTouch/docs/referenc
 - **[STR, SoundTouch Reborn](https://github.com/JRpersonal/streborn)** ([st-reborn.de](https://st-reborn.de)) — on-device agent plus desktop app; its published `iptables` REDIRECT technique is what makes AfterTouch's on-device install reachable over the LAN on co-processor chassis (see [Model Support Matrix](https://gesellix.github.io/Bose-SoundTouch/docs/reference/MODEL-SUPPORT-MATRIX/))
 - **[soundtouch-decloud](https://github.com/bitranox/soundtouch-decloud)** (bitranox): a Claude Code skill that walks a non-technical owner through moving their speakers to AfterTouch, recovering each preset's own stream, and checking that every preset plays
 
+## Other SoundTouch projects
+
+Independent projects that keep SoundTouch speakers working in their own way, without AfterTouch.
+
+- **[Air Drift for SoundTouch](https://github.com/Air-Drift/Sound-Touch)** (spedmo): a Docker container that puts internet radio back on the preset buttons, either via the speaker's WebSocket and UPnP or by answering the speaker in place of the Bose cloud
+
 ---
 
 ## Support
