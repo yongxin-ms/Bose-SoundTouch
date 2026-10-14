@@ -443,6 +443,12 @@ func TestHandleAPIControl_VolumeValidation(t *testing.T) {
 
 func TestHandleAPIControl_BassValidation(t *testing.T) {
 	app := createTestApp()
+	speaker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<bassCapabilities><bassAvailable>true</bassAvailable><bassMin>-9</bassMin><bassMax>0</bassMax><bassDefault>0</bassDefault></bassCapabilities>`))
+	}))
+	defer speaker.Close()
+	device, _ := app.GetDevice("test-device")
+	device.Client = client.NewClient(&client.Config{Host: speaker.URL})
 
 	tests := []struct {
 		name           string
@@ -1267,6 +1273,10 @@ func TestHandleZoneRemove_UsesRemoveZoneSlave(t *testing.T) {
 	var gotPath, gotBody string
 
 	speaker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/getZone" {
+			_, _ = w.Write([]byte(`<zone master="MASTERHW01"><member>SLAVEHW02</member></zone>`))
+			return
+		}
 		gotPath = r.URL.Path
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
@@ -1320,6 +1330,10 @@ func TestHandleZoneLeave_UsesRemoveZoneSlave(t *testing.T) {
 
 	// Master speaker captures the /removeZoneSlave call.
 	masterSpeaker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/getZone" {
+			_, _ = w.Write([]byte(`<zone master="MASTERHW01"><member>SLAVEHW02</member><member>SLAVEHW03</member></zone>`))
+			return
+		}
 		masterPath = r.URL.Path
 		b, _ := io.ReadAll(r.Body)
 		masterBody = string(b)

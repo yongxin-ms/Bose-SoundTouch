@@ -922,6 +922,15 @@ func (app *WebApp) HandleStorePresetContent(w http.ResponseWriter, r *http.Reque
 		contentItem.ContainerArt = app.storedMusicArtURL(r.Context(), device, contentItem.SourceAccount, contentItem.Location)
 	}
 
+	// The older playback adapter location carries the service's address, so
+	// the preset would stop playing when AfterTouch moves. Store the station
+	// the way Play URL does, as a relative Orion location (issue 784).
+	if contentItem.Source == models.OrionLocalInternetRadioSource && !models.IsOrionStationLocation(contentItem.Location) {
+		if stream, ok := models.StationStreamURL(contentItem.Location); ok {
+			contentItem.Location = bmxpkg.BuildOrionLocation(contentItem.ItemName, contentItem.ContainerArt, stream)
+		}
+	}
+
 	logPlaybackRequest("store-preset", deviceID, contentItem.Source, contentItem.SourceAccount, contentItem.Location, contentItem.ItemName)
 
 	err = device.Client.StorePreset(slot, contentItem)
@@ -978,17 +987,32 @@ func (app *WebApp) handleBassControl(w http.ResponseWriter, r *http.Request, dev
 		return
 	}
 
-	if bassReq.Level < -9 || bassReq.Level > 9 {
-		app.sendError(w, "Bass must be between -9 and 9", http.StatusBadRequest)
-		return
-	}
-
 	if device.Client == nil {
 		app.sendError(w, "Device client not available", http.StatusInternalServerError)
 		return
 	}
 
-	err := device.Client.SetBass(bassReq.Level)
+	// The speaker's capabilities only narrow the fixed range. When they can't
+	// be read, fall back to that range and write, as before they were checked;
+	// the failure is not cached, so a later request tries again.
+	capabilities, err := device.LoadBassCapabilities()
+	switch {
+	case err != nil:
+		log.Printf("[bass] device=%q: cannot read bass capabilities, using the fixed range: %v", sanitizeLog(device.Info().DeviceID), err)
+
+		if bassReq.Level < -9 || bassReq.Level > 9 {
+			app.sendError(w, "Bass must be between -9 and 9", http.StatusBadRequest)
+			return
+		}
+	case !capabilities.IsBassSupported():
+		app.sendError(w, "Bass control is unavailable on this speaker", http.StatusConflict)
+		return
+	case !capabilities.ValidateLevel(bassReq.Level):
+		app.sendError(w, fmt.Sprintf("Bass must be between %d and %d", capabilities.BassMin, capabilities.BassMax), http.StatusBadRequest)
+		return
+	}
+
+	err = device.Client.SetBass(bassReq.Level)
 	app.sendControlResponse(w, err, fmt.Sprintf("Bass set to %d", bassReq.Level))
 }
 
@@ -1674,7 +1698,12 @@ func (app *WebApp) HandleZoneAdd(w http.ResponseWriter, r *http.Request) {
 
 	zone, err := masterConn.Client.GetZone()
 	if err != nil {
-		app.sendError(w, err.Error(), http.StatusInternalServerError)
+		app.sendError(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	if !zoneControlMaster(zone, masterHwID) {
+		app.sendError(w, "Device is not the current zone master", http.StatusConflict)
 		return
 	}
 
@@ -1712,6 +1741,16 @@ func currentSourceAllowsMultiroom(nowPlaying *models.NowPlaying, sources *models
 	return false
 }
 
+func zoneControlMaster(zone *models.ZoneInfo, deviceID string) bool {
+	if zone == nil || strings.TrimSpace(deviceID) == "" {
+		return false
+	}
+
+	master := strings.TrimSpace(zone.Master)
+
+	return master == strings.TrimSpace(deviceID) || (master == "" && len(zone.Members) == 0)
+}
+
 // HandleZoneRemove removes a slave from the zone.
 func (app *WebApp) HandleZoneRemove(w http.ResponseWriter, r *http.Request) {
 	masterIP := chi.URLParam(r, "id")
@@ -1737,6 +1776,22 @@ func (app *WebApp) HandleZoneRemove(w http.ResponseWriter, r *http.Request) {
 	masterHwID := masterConn.DeviceInfo.DeviceID
 	slaveHwID := slaveConn.DeviceInfo.DeviceID
 
+	zone, err := masterConn.Client.GetZone()
+	if err != nil {
+		app.sendError(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	if !zoneControlMaster(zone, masterHwID) || masterHwID == slaveHwID {
+		app.sendError(w, "Device is not the current zone master", http.StatusConflict)
+		return
+	}
+
+	if !zone.IsMember(slaveHwID) {
+		app.sendError(w, "Device is not a current zone member", http.StatusConflict)
+		return
+	}
+
 	// Remove a single member with the dedicated /removeZoneSlave endpoint.
 	// Rebuilding the zone via /setZone with the remaining members does not
 	// reliably drop a member when the zone has more than one: the speaker only
@@ -1759,6 +1814,17 @@ func (app *WebApp) HandleZoneDissolve(w http.ResponseWriter, r *http.Request) {
 
 	if masterConn.Client == nil || masterConn.DeviceInfo == nil {
 		app.sendError(w, "Device not ready", http.StatusInternalServerError)
+		return
+	}
+
+	zone, err := masterConn.Client.GetZone()
+	if err != nil {
+		app.sendError(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	if !zoneControlMaster(zone, masterConn.DeviceInfo.DeviceID) {
+		app.sendError(w, "Device is not the current zone master", http.StatusConflict)
 		return
 	}
 
@@ -1788,7 +1854,12 @@ func (app *WebApp) HandleZoneLeave(w http.ResponseWriter, r *http.Request) {
 
 	zone, err := slaveConn.Client.GetZone()
 	if err != nil {
-		app.sendError(w, err.Error(), http.StatusInternalServerError)
+		app.sendError(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	if zone == nil || strings.TrimSpace(zone.Master) == "" || zone.Master == slaveConn.DeviceInfo.DeviceID {
+		app.sendError(w, "Device is not a current zone member", http.StatusConflict)
 		return
 	}
 
@@ -1801,6 +1872,17 @@ func (app *WebApp) HandleZoneLeave(w http.ResponseWriter, r *http.Request) {
 	masterConn, ok := app.GetDevice(masterIP)
 	if !ok || masterConn.Client == nil {
 		app.sendError(w, "Master device not available", http.StatusInternalServerError)
+		return
+	}
+
+	masterZone, err := masterConn.Client.GetZone()
+	if err != nil {
+		app.sendError(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	if !zoneControlMaster(masterZone, zone.Master) || !masterZone.IsMember(slaveConn.DeviceInfo.DeviceID) {
+		app.sendError(w, "Device is not a member of the current master zone", http.StatusConflict)
 		return
 	}
 

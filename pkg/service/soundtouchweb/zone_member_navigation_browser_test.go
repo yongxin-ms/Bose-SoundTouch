@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -32,12 +33,12 @@ func TestZoneMembersOpenFullDeviceDetailWithoutTopologyMutation(t *testing.T) {
 	server, zoneMutations := newZoneMemberNavigationServer(t, app)
 	ctx := newHeadlessChromeContext(t)
 
-	if err := chromedp.Run(ctx,
+	if err := chromedp.Do(ctx,
 		chromedp.Navigate(server.URL+"/app"),
-		chromedp.WaitVisible(".zone-card", chromedp.ByQuery),
-		chromedp.Click(".zone-card", chromedp.ByQuery),
-		chromedp.WaitVisible(".zone-member-details > summary", chromedp.ByQuery),
-		chromedp.Click(".zone-member-details > summary", chromedp.ByQuery),
+		chromedp.WaitVisible(chromedp.CSS(".zone-card")),
+		chromedp.Click(chromedp.CSS(".zone-card")),
+		chromedp.WaitVisible(chromedp.CSS(".zone-member-details > summary")),
+		chromedp.Click(chromedp.CSS(".zone-member-details > summary")),
 	); err != nil {
 		t.Fatalf("open zone detail: %v", err)
 	}
@@ -62,22 +63,22 @@ func TestZoneMemberNavigationFollowsSiblingsAndRetracesBack(t *testing.T) {
 	server, zoneMutations := newZoneMemberNavigationServer(t, app)
 	ctx := newHeadlessChromeContext(t)
 
-	if err := chromedp.Run(ctx,
+	if err := chromedp.Do(ctx,
 		chromedp.Navigate(server.URL+"/app"),
-		chromedp.WaitVisible(".zone-card", chromedp.ByQuery),
-		chromedp.Click(".zone-card", chromedp.ByQuery),
-		chromedp.WaitVisible(".zone-member-details > summary", chromedp.ByQuery),
-		chromedp.Click(".zone-member-details > summary", chromedp.ByQuery),
-		chromedp.Poll(`!document.querySelector('button.zone-member-open[aria-label="Open details for Atrium"]')`, nil),
+		chromedp.WaitVisible(chromedp.CSS(".zone-card")),
+		chromedp.Click(chromedp.CSS(".zone-card")),
+		chromedp.WaitVisible(chromedp.CSS(".zone-member-details > summary")),
+		chromedp.Click(chromedp.CSS(".zone-member-details > summary")),
+		chromedp.Poll[chromedp.Void](`!document.querySelector('button.zone-member-open[aria-label="Open details for Atrium"]')`),
 	); err != nil {
 		t.Fatalf("open zone detail without a self row button: %v", err)
 	}
 
 	openZoneMemberAndWait(t, ctx, "Breakfast Room", `document.querySelector('.zone-member-details > summary') !== null`)
-	if err := chromedp.Run(ctx,
-		chromedp.Click(".zone-member-details > summary", chromedp.ByQuery),
-		chromedp.Poll(`document.querySelector('button.zone-member-open[aria-label="Open details for Living Pair"]') &&
-			!document.querySelector('button.zone-member-open[aria-label="Open details for Breakfast Room"]')`, nil),
+	if err := chromedp.Do(ctx,
+		chromedp.Click(chromedp.CSS(".zone-member-details > summary")),
+		chromedp.Poll[chromedp.Void](`document.querySelector('button.zone-member-open[aria-label="Open details for Living Pair"]') &&
+			!document.querySelector('button.zone-member-open[aria-label="Open details for Breakfast Room"]')`),
 	); err != nil {
 		t.Fatalf("member page did not offer its siblings: %v", err)
 	}
@@ -90,17 +91,17 @@ func TestZoneMemberNavigationFollowsSiblingsAndRetracesBack(t *testing.T) {
 			button.textContent.includes('Remove from AfterTouch'))`)
 
 	for _, want := range []string{"Breakfast Room", "Atrium"} {
-		if err := chromedp.Run(ctx,
-			chromedp.Click(".device-detail .back-btn", chromedp.ByQuery),
-			chromedp.Poll(fmt.Sprintf(`document.querySelector('.page-title')?.textContent.includes(%q)`, want), nil),
+		if err := chromedp.Do(ctx,
+			chromedp.Click(chromedp.CSS(".device-detail .back-btn")),
+			chromedp.Poll[chromedp.Void](fmt.Sprintf(`document.querySelector('.page-title')?.textContent.includes(%q)`, want)),
 		); err != nil {
 			t.Fatalf("back did not return to %q: %v", want, err)
 		}
 	}
 
-	if err := chromedp.Run(ctx,
-		chromedp.Click(".device-detail .back-btn", chromedp.ByQuery),
-		chromedp.Poll(`document.querySelector('.page-title')?.textContent.trim() === 'Devices'`, nil),
+	if err := chromedp.Do(ctx,
+		chromedp.Click(chromedp.CSS(".device-detail .back-btn")),
+		chromedp.Poll[chromedp.Void](`document.querySelector('.page-title')?.textContent.trim() === 'Devices'`),
 	); err != nil {
 		t.Fatalf("back from the first detail page did not return to the device list: %v", err)
 	}
@@ -110,14 +111,64 @@ func TestZoneMemberNavigationFollowsSiblingsAndRetracesBack(t *testing.T) {
 	}
 }
 
+func TestZoneMemberLeaveShowsErrorAfterTopologyEventWithoutDoubleWrite(t *testing.T) {
+	app := newZoneMemberNavigationApp(t)
+	server, mutations := newZoneMemberNavigationServer(t, app)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	mutations.beforeLeave = func() { close(started); <-release }
+	ctx := newHeadlessChromeContext(t)
+	var sameDocument bool
+	if err := chromedp.Do(ctx,
+		chromedp.Navigate(server.URL+"/app"),
+		chromedp.WaitVisible(chromedp.CSS(".zone-card")),
+		chromedp.Click(chromedp.CSS(".zone-card")),
+		chromedp.WaitVisible(chromedp.CSS(".zone-member-details > summary")),
+		chromedp.Click(chromedp.CSS(".zone-member-details > summary")),
+	); err != nil {
+		t.Fatalf("open zone: %v", err)
+	}
+	openZoneMemberAndWait(t, ctx, "Breakfast Room", `Array.from(document.querySelectorAll('button')).some(b => b.textContent.trim() === 'Leave zone')`)
+	if err := chromedp.Do(ctx,
+		chromedp.Evaluate[chromedp.Void](`window.__zoneDocument = true; const b = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim() === 'Leave zone'); b.click(); b.click();`),
+		chromedp.Poll[chromedp.Void](`Array.from(document.querySelectorAll('button')).some(b => b.textContent.trim() === 'Leave zone' && b.disabled)`),
+		chromedp.Func(func(ctx context.Context, _ *chromedp.Target) error {
+			select {
+			case <-started:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			master, _ := app.GetDevice(zoneNavigationMaster)
+			master.UpdateStatus(func(status *webtypes.DeviceStatus) {
+				members := append([]models.Member(nil), status.Zone.Members...)
+				members = append(members, models.Member{DeviceID: "CANDIDATE", IP: zoneNavigationCandidate})
+				status.Zone = &models.ZoneInfo{Master: status.Zone.Master, Members: members}
+			})
+			app.BroadcastDeviceList()
+			return nil
+		}),
+		chromedp.Poll[chromedp.Void](`!!document.querySelector('.zone-section button[aria-label="Open details for Library"]')`),
+		chromedp.Func(func(context.Context, *chromedp.Target) error { releaseOnce.Do(func() { close(release) }); return nil }),
+		chromedp.Poll[chromedp.Void](`document.querySelector('[role="alert"]')?.textContent.includes('leave rejected')`),
+		evalInto(`window.__zoneDocument === true`, &sameDocument),
+	); err != nil {
+		t.Fatalf("leave zone: %v", err)
+	}
+	if !sameDocument || mutations.Load() != 1 || mutations.request.Load() != "/api/control/devices/"+zoneNavigationMember+"/zone/leave" {
+		t.Fatalf("same document=%v mutations=%d path=%v", sameDocument, mutations.Load(), mutations.request.Load())
+	}
+}
+
 func openZoneMemberAndWait(t *testing.T, ctx context.Context, name, condition string) {
 	t.Helper()
 
 	selector := fmt.Sprintf(`button.zone-member-open[aria-label=%q]`, "Open details for "+name)
-	if err := chromedp.Run(ctx,
-		chromedp.Click(selector, chromedp.ByQuery),
-		chromedp.Poll(fmt.Sprintf(`document.querySelector('.page-title')?.textContent.includes(%q) && (%s)`,
-			name, condition), nil),
+	if err := chromedp.Do(ctx,
+		chromedp.Click(chromedp.CSS(selector)),
+		chromedp.Poll[chromedp.Void](fmt.Sprintf(`document.querySelector('.page-title')?.textContent.includes(%q) && (%s)`,
+			name, condition)),
 	); err != nil {
 		t.Fatalf("open %q device detail: %v", name, err)
 	}
@@ -126,11 +177,11 @@ func openZoneMemberAndWait(t *testing.T, ctx context.Context, name, condition st
 func returnToZone(t *testing.T, ctx context.Context, zoneName string) {
 	t.Helper()
 
-	if err := chromedp.Run(ctx,
-		chromedp.Click(".device-detail .back-btn", chromedp.ByQuery),
-		chromedp.Poll(fmt.Sprintf(`document.querySelector('.page-title')?.textContent.includes(%q) &&
-			document.querySelector('.zone-member-details > summary') !== null`, zoneName), nil),
-		chromedp.Click(".zone-member-details > summary", chromedp.ByQuery),
+	if err := chromedp.Do(ctx,
+		chromedp.Click(chromedp.CSS(".device-detail .back-btn")),
+		chromedp.Poll[chromedp.Void](fmt.Sprintf(`document.querySelector('.page-title')?.textContent.includes(%q) &&
+			document.querySelector('.zone-member-details > summary') !== null`, zoneName)),
+		chromedp.Click(chromedp.CSS(".zone-member-details > summary")),
 	); err != nil {
 		t.Fatalf("return to %q zone detail: %v", zoneName, err)
 	}
@@ -197,7 +248,13 @@ func addZoneNavigationDevice(
 	}
 }
 
-func newZoneMemberNavigationServer(t *testing.T, app *WebApp) (*httptest.Server, *atomic.Int32) {
+type zoneNavigationMutations struct {
+	atomic.Int32
+	request     atomic.Value
+	beforeLeave func()
+}
+
+func newZoneMemberNavigationServer(t *testing.T, app *WebApp) (*httptest.Server, *zoneNavigationMutations) {
 	t.Helper()
 
 	projection := app.deviceViewSnapshot()
@@ -206,7 +263,7 @@ func newZoneMemberNavigationServer(t *testing.T, app *WebApp) (*httptest.Server,
 		t.Fatalf("unexpected zone projection: %+v", zone)
 	}
 
-	mutations := &atomic.Int32{}
+	mutations := &zoneNavigationMutations{}
 	router := chi.NewRouter()
 	app.MountWeb(router, nil)
 
@@ -214,9 +271,17 @@ func newZoneMemberNavigationServer(t *testing.T, app *WebApp) (*httptest.Server,
 		path := strings.TrimSuffix(r.URL.Path, "/")
 		if r.Method == http.MethodPost && strings.Contains(path, "/zone/") {
 			mutations.Add(1)
+			mutations.request.Store(path)
 		}
 
 		switch {
+		case r.Method == http.MethodPost && path == "/api/control/devices/"+zoneNavigationMember+"/zone/leave":
+			if mutations.beforeLeave != nil {
+				mutations.beforeLeave()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			writeZoneNavigationJSON(w, webtypes.APIResponse{Success: false, Error: "leave rejected"})
 		case r.Method == http.MethodGet && path == "/api/control/devices/"+zoneNavigationMaster+"/zone":
 			writeZoneNavigationJSON(w, webtypes.APIResponse{Success: true, Data: map[string]interface{}{
 				"masterIp":            zone.MasterControlID,

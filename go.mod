@@ -4,7 +4,7 @@ go 1.27.2
 
 require (
 	filippo.io/age v1.3.2
-	github.com/chromedp/chromedp v0.16.0
+	github.com/chromedp/chromedp v0.21.0
 	github.com/go-chi/chi/v5 v5.3.2
 	github.com/google/gopacket v1.1.19
 	github.com/gorilla/websocket v1.5.3
@@ -15,24 +15,20 @@ require (
 	github.com/srwiley/oksvg v0.0.0-20221011165216-be6e8873101c
 	github.com/srwiley/rasterx v0.0.0-20220730225603-2ab79fcdd4ef
 	github.com/urfave/cli/v2 v2.27.7
-	golang.org/x/crypto v0.57.0
-	golang.org/x/mod v0.41.0
-	golang.org/x/net v0.59.0
-	golang.org/x/sys v0.48.0
-	golang.org/x/term v0.46.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/mod v0.42.0
+	golang.org/x/net v0.61.0
+	golang.org/x/sys v0.49.0
+	golang.org/x/term v0.47.0
 )
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	filippo.io/hpke v0.4.0 // indirect
-	github.com/chromedp/cdproto v0.0.0-20260804232424-e85f50dbfd32 // indirect
-	github.com/chromedp/sysutil v1.1.0 // indirect
+	github.com/chromedp/cdproto v0.157.9 // indirect
 	github.com/cpuguy83/go-md2man/v2 v2.0.7 // indirect
 	github.com/go-json-experiment/json v0.0.0-20260820222146-c27c302e5fc3 // indirect
-	github.com/gobwas/httphead v0.1.0 // indirect
-	github.com/gobwas/pool v0.2.1 // indirect
-	github.com/gobwas/ws v1.4.0 // indirect
 	github.com/xrash/smetrics v0.0.0-20250705151800-55b8f293f342 // indirect
-	golang.org/x/image v0.46.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/image v0.47.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 )

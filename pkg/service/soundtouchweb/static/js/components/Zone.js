@@ -11,6 +11,7 @@ import {
     zoneMemberMetadata,
     zoneTopologyFingerprint,
 } from '../zonePresentation.mjs';
+import { ZoneMemberVolumeControl } from './ZoneMemberVolumeControl.js';
 
 const html = htm.bind(h);
 
@@ -40,11 +41,17 @@ function inferredPhysicalCount(members) {
         total + Math.max(1, member?.physicalMembers?.length || 0), 0);
 }
 
-export function Zone({ deviceId, devices, onSelectMember }) {
+export function Zone({ deviceId, devices, onSelectMember, volumePreview = null }) {
     const [zone, setZone] = useState(null);
     const [candidates, setCandidates] = useState({});
     const [loading, setLoading] = useState(true);
     const [showPicker, setShowPicker] = useState(false);
+    const [mutationPending, setMutationPending] = useState(false);
+    const [mutationError, setMutationError] = useState('');
+    const mutationContext = useRef(null);
+    if (mutationContext.current?.deviceId !== deviceId) {
+        mutationContext.current = { deviceId, pending: false };
+    }
     const canGroup = currentSourceAllowsMultiroom(devices?.[deviceId]);
     const projection = devices?.[zone?.masterIp || deviceId]?.zone || devices?.[deviceId]?.zone;
     const topologyFingerprint = zoneTopologyFingerprint(projection);
@@ -76,32 +83,57 @@ export function Zone({ deviceId, devices, onSelectMember }) {
     useEffect(() => {
         if (!canGroup) setShowPicker(false);
     }, [canGroup]);
+    useEffect(() => {
+        setMutationPending(false);
+        setMutationError('');
+    }, [deviceId]);
+    useEffect(() => () => { mutationContext.current = null; }, []);
+
+    async function mutate(action) {
+        const context = mutationContext.current;
+        if (context.pending) return;
+        context.pending = true;
+        setMutationPending(true);
+        setMutationError('');
+        try {
+            const response = await action();
+            if (context !== mutationContext.current) return;
+            if (!response?.success) {
+                setMutationError(response?.error || 'Zone operation failed');
+            }
+            refresh();
+        } catch (error) {
+            if (context === mutationContext.current) {
+                setMutationError(error?.message || 'Zone operation failed');
+            }
+        } finally {
+            context.pending = false;
+            if (context === mutationContext.current) setMutationPending(false);
+        }
+    }
 
     async function addDevice(slaveId) {
         if (!canGroup) return;
         setShowPicker(false);
-        await api.zoneAdd(deviceId, slaveId);
-        refresh();
+        await mutate(() => api.zoneAdd(deviceId, slaveId));
     }
 
     async function removeDevice(slaveId) {
-        await api.zoneRemove(deviceId, slaveId);
-        refresh();
+        await mutate(() => api.zoneRemove(deviceId, slaveId));
     }
 
     async function dissolve() {
-        await api.zoneDissolve(deviceId);
-        refresh();
+        await mutate(() => api.zoneDissolve(deviceId));
     }
 
     async function leave() {
-        await api.zoneLeave(deviceId);
-        refresh();
+        await mutate(() => api.zoneLeave(deviceId));
     }
 
     if (loading) return html`
         <div class="zone-section">
             <div class="section-title">Zone</div>
+            ${mutationError ? html`<div class="settings-error" role="alert">${mutationError}</div>` : null}
             <div class="loading-bar"></div>
         </div>
     `;
@@ -129,6 +161,8 @@ export function Zone({ deviceId, devices, onSelectMember }) {
         : (Number.isInteger(projection?.physicalMemberCount)
             ? projection.physicalMemberCount
             : inferredPhysicalCount(logicalMembers));
+    const zoneMasterId = projection?.masterControlId || resolvedMaster.controlId ||
+        zone?.masterIp || deviceId;
 
     // Source candidates independently from Group projection while recognizing
     // the logical IDs already represented by the current zone.
@@ -166,6 +200,23 @@ export function Zone({ deviceId, devices, onSelectMember }) {
                 </div>
             </div>
         `;
+        const previewVolume = volumePreview?.[resolved.controlId];
+        const volumeTopologyKey = JSON.stringify([
+            topologyFingerprint,
+            devices?.[zoneMasterId]?.status?.epoch ?? null,
+            devices?.[resolved.controlId]?.status?.epoch ?? null,
+            (member?.physicalMembers || []).map(physical => [
+                physical?.deviceId || '',
+                physical?.role || '',
+            ]),
+        ]);
+        const volumeProjectionKey = JSON.stringify([
+            devices?.[zoneMasterId]?.status?.epoch ?? null,
+            devices?.[zoneMasterId]?.status?.revision ?? null,
+            devices?.[resolved.controlId]?.status?.epoch ?? null,
+            devices?.[resolved.controlId]?.status?.revision ?? null,
+            Number.isFinite(member?.actualVolume) ? member.actualVolume : null,
+        ]);
 
         return html`
             <div class="zone-logical-member" key=${resolved.controlId}>
@@ -185,6 +236,17 @@ export function Zone({ deviceId, devices, onSelectMember }) {
                         ${identity}
                     </div>
                 `}
+
+                <${ZoneMemberVolumeControl}
+                    zoneMasterId=${zoneMasterId}
+                    memberId=${resolved.controlId}
+                    topologyKey=${volumeTopologyKey}
+                    projectionKey=${volumeProjectionKey}
+                    ariaLabel=${`${metadata.name} volume`}
+                    available=${member?.available !== false}
+                    volume=${member?.actualVolume}
+                    previewVolume=${previewVolume}
+                />
 
                 ${isStereoPair ? html`
                     <div class="zone-physical-members">
@@ -217,13 +279,14 @@ export function Zone({ deviceId, devices, onSelectMember }) {
     return html`
         <div class="zone-section">
             <div class="section-title">Zone</div>
+            ${mutationError ? html`<div class="settings-error" role="alert">${mutationError}</div>` : null}
 
             ${currentZone.isStandalone && html`
                 <div class="zone-row">
                     <span class="zone-status-label">Standalone</span>
                     ${available.length > 0 && html`
                         <button class="btn-secondary zone-btn" onClick=${() => setShowPicker(true)}
-                            disabled=${!canGroup}>+ Group with…</button>
+                            disabled=${!canGroup || mutationPending}>+ Group with…</button>
                     `}
                 </div>
                 ${available.length > 0 && !canGroup && html`
@@ -255,6 +318,7 @@ export function Zone({ deviceId, devices, onSelectMember }) {
                                     <div class="zone-management-member" key=${resolved.controlId}>
                                         <span>${name}</span>
                                         <button class="btn-icon zone-remove" title="Remove from zone"
+                                            disabled=${mutationPending}
                                             aria-label=${`Remove ${name} from zone`}
                                             onClick=${() => removeDevice(memberID)}>✕</button>
                                     </div>
@@ -265,9 +329,9 @@ export function Zone({ deviceId, devices, onSelectMember }) {
                     <div class="zone-actions">
                         ${available.length > 0 && html`
                             <button class="btn-secondary zone-btn" onClick=${() => setShowPicker(true)}
-                                disabled=${!canGroup}>+ Add speaker</button>
+                                disabled=${!canGroup || mutationPending}>+ Add speaker</button>
                         `}
-                        <button class="btn-secondary zone-btn" onClick=${dissolve}>Dissolve zone</button>
+                        <button class="btn-secondary zone-btn" disabled=${mutationPending} onClick=${dissolve}>Dissolve zone</button>
                     </div>
                 </div>
             `}
@@ -277,7 +341,7 @@ export function Zone({ deviceId, devices, onSelectMember }) {
                     <div class="zone-management-title">Zone management</div>
                     <div class="zone-row">
                         <span class="zone-status-label">Zone: ${currentZone.masterName || deviceName(currentZone.masterIp)}</span>
-                        <button class="btn-secondary zone-btn" onClick=${leave}>Leave zone</button>
+                        <button class="btn-secondary zone-btn" disabled=${mutationPending} onClick=${leave}>Leave zone</button>
                     </div>
                 </div>
             `}
@@ -288,7 +352,7 @@ export function Zone({ deviceId, devices, onSelectMember }) {
                         <div class="picker-title">Add to zone</div>
                         <div class="picker-devices">
                             ${available.map(([ip, d]) => html`
-                                <button class="picker-device-btn" key=${ip} onClick=${() => addDevice(ip)}>
+                                <button class="picker-device-btn" key=${ip} disabled=${mutationPending} onClick=${() => addDevice(ip)}>
                                     <div class="picker-device-info">
                                         <span class="picker-device-name">${d.info?.name || ip}</span>
                                         <span class="picker-device-ip">${d.info?.ip_address || ip}</span>

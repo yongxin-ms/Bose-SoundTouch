@@ -134,6 +134,16 @@ func (m *Manager) checkMigrationDataReady(deviceIP string) ([]string, error) {
 		return nil, mismatch.err()
 	}
 
+	// A speaker can report two presets on one button. Data Sync keeps one per
+	// button, so the live list stays one longer than /full and re-syncing can
+	// never close the gap. Only the speaker can resolve it (discussion 708).
+	if slot := firstDuplicateMigrationSlot(live); slot != "" {
+		return nil, &MigrationDataNotReadyError{
+			Reason: fmt.Sprintf("the speaker reports more than one preset on button %s", slot),
+			Action: fmt.Sprintf("Store or clear preset %s on the speaker, run Data Sync, then retry migration.", slot),
+		}
+	}
+
 	if mismatch := compareMigrationPresets("live /presets", live, "rendered /full", fullPresets); mismatch != nil {
 		return nil, mismatch.err()
 	}
@@ -155,11 +165,12 @@ func migrationPresetIdentities(presets []models.ServicePreset) []migrationPreset
 			slot = presets[i].ID
 		}
 
-		// Clearing a slot through the Marge API leaves a zero-value entry in
-		// the list (RemovePreset assigns models.ServicePreset{}), persisted as
-		// <preset id="">. The rendered /full drops it, so counting it here
-		// would report a mismatch for a datastore that is perfectly in sync.
-		// An empty slot carries no identity to compare either way.
+		// Older versions cleared a slot by leaving a zero-value entry in the
+		// list, persisted as <preset id="">. Reading the file drops those now
+		// (issue 784), but a caller can still hand one in. The rendered /full
+		// drops it, so counting it here would report a mismatch for a
+		// datastore that is perfectly in sync. An empty slot carries no
+		// identity to compare either way.
 		if slot == "" {
 			continue
 		}
@@ -172,6 +183,21 @@ func migrationPresetIdentities(presets []models.ServicePreset) []migrationPreset
 	}
 
 	return result
+}
+
+// firstDuplicateMigrationSlot returns the first slot that occurs more than
+// once, or "" when every slot is unique.
+func firstDuplicateMigrationSlot(presets []migrationPresetIdentity) string {
+	seen := make(map[string]bool, len(presets))
+	for _, preset := range presets {
+		if seen[preset.Slot] {
+			return preset.Slot
+		}
+
+		seen[preset.Slot] = true
+	}
+
+	return ""
 }
 
 func migrationFullPresets(fullXML []byte, deviceID string) ([]migrationPresetIdentity, int, error) {
