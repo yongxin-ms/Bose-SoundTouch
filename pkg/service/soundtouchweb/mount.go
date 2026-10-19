@@ -8,7 +8,15 @@ import (
 
 	"github.com/gesellix/bose-soundtouch/pkg/discovery"
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
 )
+
+// defaultDiscoverTimeout budgets the search phases of one UI-triggered
+// discovery: the 10 s SSDP phase plus the service's subnet scan (up to 60 s)
+// and the follow-up device re-sync. It is not a hard end-to-end limit: a device
+// lookup already in flight when it expires may still finish afterwards, but no
+// further device is handled and the UI is told "failed".
+const defaultDiscoverTimeout = 90 * time.Second
 
 // MountWeb registers the portable soundtouch-player surface on r: the embedded
 // assets (/app/static/*), the control API (/api/control/*), and the SPA
@@ -46,15 +54,34 @@ func (app *WebApp) MountWeb(r chi.Router, discoveryService *discovery.UnifiedDis
 		r.Post("/discover", func(w http.ResponseWriter, r *http.Request) {
 			app.HandleAPIDiscover(w, r)
 
+			// The client IP resolved by the host's client-IP middleware
+			// (X-Forwarded-For only from a trusted proxy), else the socket peer.
+			remoteAddr := middleware.GetClientIP(r.Context())
+			if remoteAddr == "" {
+				remoteAddr = r.RemoteAddr
+			}
+
 			// Trigger discovery
 			//nolint:contextcheck // Context is created within goroutine
 			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				timeout := app.discoverTimeout
+				if timeout <= 0 {
+					timeout = defaultDiscoverTimeout
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), timeout)
 				defer cancel()
 
-				app.BroadcastDiscoveryStatus("starting", app.DeviceCount())
+				// Busy: the active sweep owns the status; publish nothing.
+				if !app.DiscoverDevicesFrom(ctx, discoveryService, remoteAddr) {
+					return
+				}
 
-				app.DiscoverDevices(ctx, discoveryService)
+				if ctx.Err() != nil {
+					app.BroadcastDiscoveryStatus("failed", app.DeviceCount())
+
+					return
+				}
 
 				app.BroadcastDiscoveryStatus("completed", app.DeviceCount())
 				app.BroadcastDeviceList()

@@ -4,6 +4,8 @@ services:
     # build: .
     container_name: soundtouch-service
     # Linux only, required for discovery. Swarm requires host network at the task level.
+    # WARNING: host networking bypasses Docker's published-port rules, so hosts running
+    # ufw must open 8000/tcp and 8443/tcp themselves.
     # network_mode: host
     ports:
       - "8000:8000"
@@ -15,7 +17,14 @@ services:
       - LOG_PROXY_BODY=false
       - REDACT_PROXY_LOGS=true
       - RECORD_INTERACTIONS=true
+      # Periodic background discovery is off by default; "Scan Again" always works.
+      # - DISCOVERY_ENABLED=true
       - DISCOVERY_INTERVAL=5m
+      # Bridge networking cannot receive SSDP multicast; "Scan Again" probes these CIDRs.
+      # 203.0.113.0/24 is an RFC 5737 documentation range: replace it with your own LAN CIDR.
+      # - DISCOVERY_SUBNETS=203.0.113.0/24
+      # Also run that scan on a schedule (off by default; at least 1h recommended).
+      # - DISCOVERY_SCAN_INTERVAL=6h
       - SERVER_URL=http://${SOUNDTOUCH_HOSTNAME:-soundtouch.local}:8000
       - HTTPS_SERVER_URL=https://${SOUNDTOUCH_HOSTNAME:-soundtouch.local}:8443
     volumes:
