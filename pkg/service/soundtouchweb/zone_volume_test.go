@@ -27,6 +27,7 @@ type volumeTestSpeaker struct {
 	volumeGets     int
 	ignoreWrites   bool
 	volumeResponse string
+	volumeQueue    []int
 	writeStatus    int
 	writeBody      string
 	uncertainWrite bool
@@ -81,6 +82,10 @@ func newVolumeTestSpeaker(t *testing.T, volume int, zoneXML string) *volumeTestS
 			speaker.volumeGets++
 			get := speaker.volumeGets
 			volume := speaker.volume
+			if len(speaker.volumeQueue) > 0 {
+				volume = speaker.volumeQueue[0]
+				speaker.volumeQueue = speaker.volumeQueue[1:]
+			}
 			response := speaker.volumeResponse
 			hook := speaker.onVolumeGet
 			speaker.mu.Unlock()
@@ -205,10 +210,10 @@ func TestHandleZoneVolumeSharedDeltaClampAndPartialReadback(t *testing.T) {
 
 	masterVolume, masterPosts, masterGets := masterSpeaker.operations()
 	memberVolume, memberPosts, memberGets := memberSpeaker.operations()
-	if masterVolume != 100 || fmt.Sprint(masterPosts) != "[100]" || masterGets != 1 {
+	if masterVolume != 100 || fmt.Sprint(masterPosts) != "[100]" || masterGets != 2 {
 		t.Fatalf("master operations = volume %d posts %v gets %d", masterVolume, masterPosts, masterGets)
 	}
-	if memberVolume != 70 || fmt.Sprint(memberPosts) != "[75]" || memberGets != 1 {
+	if memberVolume != 70 || fmt.Sprint(memberPosts) != "[75]" || memberGets != 4 {
 		t.Fatalf("member operations = volume %d posts %v gets %d", memberVolume, memberPosts, memberGets)
 	}
 	writeConcurrency.Lock()
@@ -402,7 +407,7 @@ func TestHandleZoneVolumeConfirmsTargetWhileActualRamps(t *testing.T) {
 			t.Fatalf("ramping actual = %+v", member)
 		}
 	}
-	if _, posts, gets := memberSpeaker.operations(); fmt.Sprint(posts) != "[80]" || gets != 1 {
+	if _, posts, gets := memberSpeaker.operations(); fmt.Sprint(posts) != "[80]" || gets != 2 { // fresh baseline read + one readback
 		t.Fatalf("operations = posts %v gets %d", posts, gets)
 	}
 }

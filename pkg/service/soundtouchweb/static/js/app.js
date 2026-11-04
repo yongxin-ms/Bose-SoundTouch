@@ -76,7 +76,7 @@ function acceptsNewerStatus(current, incoming) {
 }
 
 export function mergeDevicesSnapshot(previous, snapshot) {
-    return Object.fromEntries(Object.entries(snapshot || {}).map(([deviceId, incoming]) => {
+    const devices = Object.fromEntries(Object.entries(snapshot || {}).map(([deviceId, incoming]) => {
         const current = Object.prototype.hasOwnProperty.call(previous, deviceId)
             ? previous[deviceId] : null;
         if (!current || acceptsNewerStatus(current.status, incoming?.status)) {
@@ -92,6 +92,116 @@ export function mergeDevicesSnapshot(previous, snapshot) {
         // device-list broadcast).
         return [deviceId, current];
     }));
+    return reconcileZoneMemberships(refreshAcceptedZoneMembers(devices));
+}
+
+// The server projects a member's zoneMembership from its master's status, but
+// each entry above is accepted on its own revision. A join or dissolution that
+// only moves the master's revision would leave the member's entry claiming the
+// old state. Derive membership from the zones we accepted instead, so the
+// master's zone and its members' memberships can't disagree. A stale snapshot
+// can't revive a membership this way, because the master's zone is still
+// revision-gated.
+function reconcileZoneMemberships(devices) {
+    const claims = new Map();
+    for (const [masterId, device] of Object.entries(devices)) {
+        const zone = device?.zone;
+        if (zone?.masterControlId !== masterId || !Array.isArray(zone.members)) continue;
+        for (const member of zone.members) {
+            if (!member?.controlId || member.controlId === masterId) continue;
+            claims.set(member.controlId, [...(claims.get(member.controlId) || []), masterId]);
+        }
+    }
+
+    return Object.fromEntries(Object.entries(devices).map(([id, device]) => {
+        const masters = claims.get(id) || [];
+        if (masters.length !== 1) {
+            if (!device?.zoneMembership) return [id, device];
+            const { zoneMembership: _dropped, ...rest } = device;
+            return [id, rest];
+        }
+
+        const master = devices[masters[0]];
+        const masterMember = master.zone.members.find(member => member?.controlId === masters[0]);
+        return [id, { ...device, zoneMembership: {
+            masterControlId: masters[0],
+            masterName: masterMember?.name || master.info?.name || '',
+            degraded: Boolean(master.zone.degraded),
+        } }];
+    }));
+}
+
+// Mirrors projectedConnectivity on the server. Null when the status doesn't say.
+function statusConnectivity(status) {
+    if (status?.connectivity) return status.connectivity;
+    if (typeof status?.isConnected !== 'boolean') return null;
+    return status.isConnected ? 'online' : 'offline';
+}
+
+function withMemberConnectivity(member, identity, connectivity) {
+    if (!connectivity || connectivity === member.connectivity) return member;
+    const available = connectivity === 'online';
+    return { ...member, connectivity, available,
+        physicalMembers: member.physicalMembers?.map(physical => physical?.deviceId === identity
+            ? { ...physical, connectivity, available } : physical) };
+}
+
+// Zone volume and availability depend on every member's accepted status, not
+// just the master's revision. Keep accepted topology intact and update only the
+// matching logical members' values; a stale master snapshot cannot revive old
+// membership.
+function refreshAcceptedZoneMembers(devices) {
+    return Object.fromEntries(Object.entries(devices).map(([id, device]) => {
+        if (!Array.isArray(device?.zone?.members)) return [id, device];
+        let changed = false;
+        let availabilityChanged = false;
+        const members = device.zone.members.map(member => {
+            const current = devices[member.controlId];
+            const identity = current?.info?.device_id;
+            if (current?.volumeIdentityPending || !identity || identity !== member.hwId ||
+                !member.deviceIds?.includes(identity)) return member;
+            const refreshed = withMemberConnectivity(member, identity,
+                statusConnectivity(current.status));
+            if (refreshed !== member) {
+                changed = true;
+                availabilityChanged = true;
+            }
+            const expectedPair = member.stereoPair;
+            const currentPair = current.stereoPair;
+            if (Boolean(expectedPair) !== Boolean(currentPair)) return refreshed;
+            if (expectedPair && JSON.stringify(volumePairIdentity(expectedPair)) !==
+                JSON.stringify(volumePairIdentity(currentPair))) return refreshed;
+            const group = current.status?.group;
+            if (expectedPair) {
+                const reportedPair = { id: String(group?.ID || '').trim(),
+                    masterDeviceId: String(group?.MasterDeviceID || '').trim(),
+                    members: (group?.Roles?.Roles || []).map(role => ({
+                        deviceId: String(role.DeviceID || '').trim(), role: String(role.Role || '').trim().toUpperCase(),
+                    })) };
+                if (JSON.stringify(volumePairIdentity(expectedPair)) !==
+                    JSON.stringify(volumePairIdentity(reportedPair))) return refreshed;
+            } else if (group?.ID || group?.MasterDeviceID || group?.Roles?.Roles?.length) return refreshed;
+            const volume = current.status?.volume?.ActualVolume;
+            if (!Number.isSafeInteger(volume) || volume < 0 || volume > 100 ||
+                refreshed.actualVolume === volume) return refreshed;
+            changed = true;
+            return { ...refreshed, actualVolume: volume };
+        });
+        if (!changed) return [id, device];
+        const volumes = members.map(member => member.actualVolume).filter(Number.isFinite);
+        const zone = { ...device.zone, members,
+            volume: volumes.length ? Math.max(...volumes) : device.zone.volume };
+        if (availabilityChanged) {
+            zone.availableMemberCount = members.filter(member => member.available).length;
+            zone.degraded = members.some(member => !member.available || member.stereoPair?.degraded);
+        }
+        return [id, { ...device, zone }];
+    }));
+}
+
+function volumePairIdentity(pair) {
+    return [pair?.id, pair?.masterDeviceId,
+        (pair?.members || []).map(member => [member.deviceId, member.role]).sort()];
 }
 
 function replaceDevice(previous, deviceId, device) {
@@ -110,10 +220,15 @@ export function mergeStatusUpdate(previous, deviceId, status) {
         !acceptsNewerStatus(previous[deviceId]?.status, status)) {
         return previous;
     }
-    return replaceDevice(previous, deviceId, {
+    return refreshAcceptedZoneMembers(replaceDevice(previous, deviceId, {
         ...previous[deviceId],
         status,
-    });
+        // A status delta carries no fresh info identity. After a connection
+        // replacement, wait for a full accepted inventory before deriving its
+        // contribution to a retained logical group.
+        volumeIdentityPending: previous[deviceId].volumeIdentityPending ||
+            statusEpoch(previous[deviceId].status) !== statusEpoch(status),
+    }));
 }
 
 export function DeviceDetail({
@@ -127,13 +242,16 @@ export function DeviceDetail({
     onStatusReadback,
     onNavigate,
     commandReadbackDelays = DISCRETE_COMMAND_READBACK_DELAYS_MS,
+    recentsRefreshToken = 0,
 }) {
     const device = devices[deviceId];
     const status = device?.status;
     const controlsMode = device?.zone && !device.zone.isStandalone &&
         device.zone.masterControlId === deviceId ? 'zone' : 'device';
     const topologyFingerprint = zoneTopologyFingerprint(device?.zone);
-    const controlsTargetKey = `${deviceId}:${controlsMode}:${statusEpoch(status) ?? ''}:${topologyFingerprint}`;
+    const memberEpochs = controlsMode === 'zone' ? (device.zone.members || []).map(member =>
+        [member.controlId, statusEpoch(devices[member.controlId]?.status)]) : [];
+    const controlsTargetKey = `${deviceId}:${controlsMode}:${statusEpoch(status) ?? ''}:${topologyFingerprint}:${JSON.stringify(memberEpochs)}`;
     const [zoneVolumePreview, setZoneVolumePreview] = useState(null);
     const previewExpiryRef = useRef(null);
 
@@ -372,6 +490,7 @@ export function DeviceDetail({
                 key=${controlsMode === 'zone' ? controlsTargetKey : deviceId}
                 deviceId=${deviceId}
                 device=${device}
+                devices=${devices}
                 status=${device.status}
                 command=${command}
                 commandBusy=${commandBusy}
@@ -423,6 +542,10 @@ export function DeviceDetail({
             />
             <${Recents}
                 deviceId=${deviceId}
+                physicalId=${device.info?.device_id}
+                epoch=${device.status?.epoch}
+                revision=${device.status?.recentsRevision}
+                refreshToken=${recentsRefreshToken}
                 presets=${device.status?.presets}
                 command=${command}
                 commandBusy=${commandBusy}
@@ -474,6 +597,7 @@ function App() {
     // 'connecting' until the first frame arrives, so a page opened while the
     // service is down does not claim the connection was lost.
     const [connection, setConnection] = useState('connecting');
+    const [recentsRefreshToken, setRecentsRefreshToken] = useState(0);
     const [contentPlaybackRequest, setContentPlaybackRequest] = useState(null);
     const [contentPlaybackBusy, setContentPlaybackBusy] = useState(false);
     const contentPlaybackRef = useRef({ generation: 0, busy: false });
@@ -559,6 +683,7 @@ function App() {
             ws.onopen = () => {
                 backoff = RECONNECT_BASE_MS;
                 setConnection('online');
+                setRecentsRefreshToken(token => token + 1);
             };
 
             ws.onmessage = handleMessage;
@@ -785,6 +910,7 @@ function App() {
                         notify=${showToast}
                         onRemove=${removeDevice}
                         onStatusReadback=${mergeDeviceReadback}
+                        recentsRefreshToken=${recentsRefreshToken}
                         onNavigate=${navigate}
                     />
                 ` : page === 'tunein' ? html`

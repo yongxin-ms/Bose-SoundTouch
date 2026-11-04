@@ -412,8 +412,59 @@ img { display: block; max-width: 100%; }
 .device-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .zone-card {
+    padding: 0;
+    cursor: default;
     overflow: hidden;
 }
+.zone-card-open {
+    width: 100%;
+    padding: 1rem;
+    color: inherit;
+    text-align: left;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+.zone-card-open:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -3px;
+}
+.zone-volume-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 3ch;
+    gap: .3rem .6rem;
+    align-items: center;
+    padding: .75rem 1rem .85rem;
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+}
+.zone-volume-label { grid-column: 1; grid-row: 1; font-size: .78rem; color: var(--text-dim); }
+.zone-volume-slider {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    min-width: 0;
+    accent-color: var(--accent);
+    touch-action: pan-y;
+}
+.zone-volume-slider:disabled { opacity: .45; }
+.zone-volume-value {
+    grid-column: 2;
+    grid-row: 1;
+    color: var(--text);
+    font-size: .8rem;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+}
+.zone-card[aria-busy="true"] .zone-volume-value { color: var(--text-dim); }
+.zone-volume-failure {
+    padding: 0 1rem .75rem;
+    background: var(--bg);
+    color: var(--danger);
+    font-size: .75rem;
+    line-height: 1.35;
+}
+.zone-card-volume-control[aria-busy="true"] .zone-volume-value { color: var(--text-dim); }
 .zone-card.degraded { border-color: var(--stale); }
 .zone-card-summary {
     display: flex;
@@ -1048,7 +1099,8 @@ img.now-playing-source-icon { width: 28px; height: 28px; object-fit: contain; fi
     transition: background .1s, box-shadow .1s;
     min-height: 56px;
 }
-.preset-slot:hover:not(:disabled) { background: var(--bg); box-shadow: var(--shadow); }
+.preset-slot:hover:not(:disabled) { box-shadow: var(--shadow); }
+.preset-slot:hover:not(:disabled):not(.active) { background: var(--bg); }
 .preset-slot:disabled { opacity: .4; cursor: default; }
 .preset-slot.active {
     border-color: var(--accent);
@@ -1056,6 +1108,9 @@ img.now-playing-source-icon { width: 28px; height: 28px; object-fit: contain; fi
     background: var(--accent);
     color: var(--accent-fg);
 }
+/* A selected tile stays readable while a command runs: .4 would drop its text
+   to about 3:1 in both themes. */
+.preset-slot.active:disabled { opacity: .75; }
 .preset-slot.active .preset-name,
 .preset-slot.active .preset-source-label,
 .preset-slot.active .preset-num { color: var(--accent-fg); }
@@ -1397,7 +1452,7 @@ img.catalog-entry-icon { object-fit: contain; filter: var(--content-icon-filter)
     font-size: .8rem;
     transition: background .1s, border-color .1s;
 }
-.source-btn:hover:not(:disabled) { background: var(--bg); }
+.source-btn:hover:not(:disabled):not(.active) { background: var(--bg); }
 .source-btn:disabled { cursor: not-allowed; opacity: .55; }
 .source-btn.active { border-color: var(--slot-color, var(--accent)); background: var(--accent); color: var(--accent-fg); }
 .source-btn.pending { cursor: wait; }

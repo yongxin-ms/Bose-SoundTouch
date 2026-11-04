@@ -42,6 +42,13 @@ type WebApp struct {
 	settingsLocksMu sync.Mutex
 	settingsLocks   map[string]*sync.Mutex
 
+	// Group and member moves share one batch lock per authoritative zone master.
+	// Direct single-speaker writes only take the per-device volume operation
+	// lock (see handleDirectVolumeWrite), not this one.
+	zoneVolumeLocks sync.Map
+	// Tests can advance events during the bounded readback convergence wait.
+	volumeReadbackRetryWait func(time.Duration)
+
 	Upgrader websocket.Upgrader
 	// WSClients maps each registered browser WebSocket connection to its own
 	// write-serialization lock (see withConnWrite). Gorilla permits only one
@@ -594,7 +601,7 @@ func (app *WebApp) HandleAPIDevice(w http.ResponseWriter, r *http.Request) {
 	// Update device status to get fresh power state
 	app.UpdateDeviceStatus(deviceID, device)
 
-	// Connect WebSocket for real-time updates if not already connected
+	// Safety net: registration already starts the event subscription; this is a no-op while it runs
 	if device.CurrentWebSocket() == nil {
 		go app.ConnectDeviceWebSocket(deviceID, device)
 	}
@@ -688,7 +695,7 @@ func (app *WebApp) HandleAPIControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Connect WebSocket for real-time updates if not already connected
+	// Safety net: registration already starts the event subscription; this is a no-op while it runs
 	if device.CurrentWebSocket() == nil {
 		go app.ConnectDeviceWebSocket(deviceID, device)
 	}
@@ -789,8 +796,24 @@ func (app *WebApp) handleVolumeControl(w http.ResponseWriter, r *http.Request, d
 		return
 	}
 
-	err := device.Client.SetVolume(volumeReq.Level)
-	app.sendControlResponse(w, err, fmt.Sprintf("Volume set to %d", volumeReq.Level))
+	app.handleDirectVolumeWrite(w, device, volumeReq.Level)
+}
+
+// handleDirectVolumeWrite is the single-speaker volume route. It stays
+// write-only, as before group volume gained readbacks: no topology gate, no
+// readback, no device-list broadcast (the slider is a hot path, and events
+// report the result). It does take the per-device volume operation lock, so
+// it cannot land between a group or member move's write and its readback on
+// the same speaker. It does not take the zone batch lock: a direct write can
+// still fall between a zone move's baseline read and its write.
+func (app *WebApp) handleDirectVolumeWrite(w http.ResponseWriter, device *webtypes.DeviceConnection, level int) {
+	var err error
+
+	device.WithVolumeOperation(func() {
+		err = device.Client.SetVolume(level)
+	})
+
+	app.sendControlResponse(w, err, fmt.Sprintf("Volume set to %d", level))
 }
 
 // handlePresetControl processes preset control requests
@@ -1206,7 +1229,7 @@ func (app *WebApp) HandleDeviceKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Connect WebSocket for real-time updates if not already connected
+	// Safety net: registration already starts the event subscription; this is a no-op while it runs
 	if device.CurrentWebSocket() == nil {
 		go app.ConnectDeviceWebSocket(deviceID, device)
 	}
@@ -1238,7 +1261,7 @@ func (app *WebApp) HandleDirectVolumeControl(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Connect WebSocket for real-time updates if not already connected
+	// Safety net: registration already starts the event subscription; this is a no-op while it runs
 	if device.CurrentWebSocket() == nil {
 		go app.ConnectDeviceWebSocket(deviceID, device)
 	}
@@ -1250,8 +1273,7 @@ func (app *WebApp) HandleDirectVolumeControl(w http.ResponseWriter, r *http.Requ
 
 	w.Header().Set("Content-Type", "application/json")
 
-	err = device.Client.SetVolume(volumeLevel)
-	app.sendControlResponse(w, err, fmt.Sprintf("Volume set to %d", volumeLevel))
+	app.handleDirectVolumeWrite(w, device, volumeLevel)
 }
 
 // HandleDevicePower handles power toggle commands for devices
@@ -1264,7 +1286,7 @@ func (app *WebApp) HandleDevicePower(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Connect WebSocket for real-time updates if not already connected
+	// Safety net: registration already starts the event subscription; this is a no-op while it runs
 	if device.CurrentWebSocket() == nil {
 		go app.ConnectDeviceWebSocket(deviceID, device)
 	}

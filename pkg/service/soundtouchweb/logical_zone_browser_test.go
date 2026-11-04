@@ -58,15 +58,17 @@ func TestOpenZoneDetailTracksExternalTopologyChanges(t *testing.T) {
 	if err := chromedp.Do(ctx,
 		chromedp.Navigate(server.URL+"/app"),
 		chromedp.WaitVisible(chromedp.CSS(".zone-card")),
-		chromedp.Poll[chromedp.Void](`Array.from(document.querySelectorAll('.device-card')).some(card =>
-			card.querySelector('.device-name')?.textContent.trim() === 'Breakfast Room' &&
-			card.querySelector('.zone-member-badge')?.textContent.trim() === 'In group · Atrium') &&
+		chromedp.Poll[chromedp.Void](`document.querySelectorAll('.device-card').length === 1 &&
+			document.querySelector('.zone-card .device-name')?.textContent.trim() === 'Atrium' &&
 			!document.querySelector('.zone-card .zone-member-badge')`),
+		chromedp.Evaluate[chromedp.Void](`window.__zoneDocument = true`),
 		chromedp.Click(chromedp.CSS(".zone-card")),
 		chromedp.WaitVisible(chromedp.CSS(".zone-member-details > summary")),
 		chromedp.Click(chromedp.CSS(".zone-member-details > summary")),
 		chromedp.Poll[chromedp.Void](`document.querySelectorAll('.zone-logical-member').length === 2 &&
-			document.querySelectorAll('.zone-logical-member [role="status"][aria-label]').length === 2`),
+			document.querySelectorAll('.zone-logical-member [role="status"][aria-label]').length === 2 &&
+			document.querySelector('.zone-member-details button[aria-label$="details for Breakfast Room"]') &&
+			document.querySelector('.zone-member-details').textContent.includes('192.0.2.11')`),
 	); err != nil {
 		t.Fatalf("open logical zone detail: %v", err)
 	}
@@ -108,6 +110,99 @@ func TestOpenZoneDetailTracksExternalTopologyChanges(t *testing.T) {
 	}
 	if elapsed := time.Since(createStarted); elapsed > 5*time.Second {
 		t.Fatalf("external creation took %s; periodic fallback masked the event path", elapsed)
+	}
+
+	if err := chromedp.Do(ctx,
+		chromedp.Click(chromedp.CSS(".device-detail .back-btn")),
+		chromedp.Poll[chromedp.Void](`document.querySelectorAll('.device-card').length === 1 &&
+			document.querySelector('.zone-card')`),
+	); err != nil {
+		t.Fatalf("return to grouped dashboard: %v", err)
+	}
+	master.UpdateStatus(func(status *webtypes.DeviceStatus) { status.Zone = nil })
+	app.BroadcastDeviceList()
+	if err := chromedp.Do(ctx, chromedp.Poll[chromedp.Void](`window.__zoneDocument === true &&
+		document.querySelectorAll('.device-card').length === 2 && !document.querySelector('.zone-card') &&
+		Array.from(document.querySelectorAll('.device-name')).some(name => name.textContent.trim() === 'Breakfast Room')`)); err != nil {
+		t.Fatalf("dissolution did not restore member dashboard card without reload: %v", err)
+	}
+	master.UpdateStatus(func(status *webtypes.DeviceStatus) { status.Zone = zone })
+	app.BroadcastDeviceList()
+	if err := chromedp.Do(ctx, chromedp.Poll[chromedp.Void](`window.__zoneDocument === true &&
+		document.querySelectorAll('.device-card').length === 1 && document.querySelector('.zone-card')`)); err != nil {
+		t.Fatalf("creation did not suppress duplicate member dashboard card without reload: %v", err)
+	}
+}
+
+// A zone change on the master alone doesn't move the member's status revision,
+// so the browser keeps the member's entry from the earlier snapshot. The
+// dashboard still has to follow the master, without waiting for the member.
+func TestDashboardFollowsMasterOnlyZoneChanges(t *testing.T) {
+	const (
+		masterID = "192.0.2.10"
+		memberID = "192.0.2.11"
+	)
+	zone := &models.ZoneInfo{
+		Master: "master-device",
+		Members: []models.Member{
+			{DeviceID: "master-device", IP: masterID},
+			{DeviceID: "member-device", IP: memberID},
+		},
+	}
+	app := NewWebApp()
+	master := projectionDeviceWithZone(masterID, "master-device", "Atrium", true, nil, nil)
+	member := projectionDeviceWithZone(memberID, "member-device", "Breakfast Room", true, nil, nil)
+	app.AddDevice(master.ID, master.Device)
+	app.AddDevice(member.ID, member.Device)
+
+	router := chi.NewRouter()
+	app.MountWeb(router, nil)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+
+	ctx := newHeadlessChromeContext(t)
+	if err := chromedp.Do(ctx,
+		chromedp.Navigate(server.URL+"/app"),
+		chromedp.Poll[chromedp.Void](`document.querySelectorAll('.device-card').length === 2 &&
+			!document.querySelector('.zone-card')`),
+	); err != nil {
+		t.Fatalf("standalone dashboard: %v", err)
+	}
+
+	master.Device.UpdateStatus(func(status *webtypes.DeviceStatus) { status.Zone = zone })
+	app.BroadcastDeviceList()
+	if err := chromedp.Do(ctx, chromedp.Poll[chromedp.Void](`document.querySelectorAll('.device-card').length === 1 &&
+		document.querySelector('.zone-card .device-name')?.textContent.trim() === 'Atrium'`)); err != nil {
+		t.Fatalf("first join kept the member's duplicate card: %v", err)
+	}
+
+	setMemberOnline := func(online bool) {
+		connectivity := webtypes.ConnectivityOffline
+		if online {
+			connectivity = webtypes.ConnectivityOnline
+		}
+		member.Device.UpdateStatus(func(status *webtypes.DeviceStatus) {
+			status.IsConnected = online
+			status.Connectivity = connectivity
+		})
+		app.BroadcastDeviceList()
+	}
+	setMemberOnline(false)
+	if err := chromedp.Do(ctx, chromedp.Poll[chromedp.Void](`document.querySelector('.zone-card .device-indicator')
+		?.getAttribute('aria-label') === 'Degraded group: 1 unavailable'`)); err != nil {
+		t.Fatalf("hidden member going offline left the group card healthy: %v", err)
+	}
+	setMemberOnline(true)
+	if err := chromedp.Do(ctx, chromedp.Poll[chromedp.Void](`document.querySelector('.zone-card .device-indicator')
+		?.getAttribute('aria-label') === 'Healthy group'`)); err != nil {
+		t.Fatalf("hidden member recovering left the group card degraded: %v", err)
+	}
+
+	master.Device.UpdateStatus(func(status *webtypes.DeviceStatus) { status.Zone = nil })
+	app.BroadcastDeviceList()
+	if err := chromedp.Do(ctx, chromedp.Poll[chromedp.Void](`document.querySelectorAll('.device-card').length === 2 &&
+		!document.querySelector('.zone-card') && !document.querySelector('.zone-member-badge')`)); err != nil {
+		t.Fatalf("dissolution left the member card marked as grouped: %v", err)
 	}
 }
 

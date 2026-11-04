@@ -32,6 +32,23 @@ function addIdentifier(ids, value) {
     if (typeof value === 'string' && value.trim()) ids.add(value.trim());
 }
 
+// Keep the inventory intact for member detail routes. A member's duplicate
+// card is hidden only when its membership and the master's zone agree. Both
+// come from the master's claim, so this says the group card lists the member,
+// not that the speaker itself confirmed it.
+export function filterGroupedDeviceEntries(entries) {
+    const devices = Object.fromEntries(entries);
+    const grouped = ([id, device]) => {
+        const masterID = device?.zoneMembership?.masterControlId;
+        const master = masterID && masterID !== id ? devices[masterID] : null;
+        return !!master && !master.zoneMembership && !device.zone &&
+            master.zone?.masterControlId === masterID &&
+            Array.isArray(master.zone.members) &&
+            master.zone.members.some(member => member?.controlId === id);
+    };
+    return entries.filter(entry => !grouped(entry));
+}
+
 export function zoneMemberIdentifiers(...members) {
     const ids = new Set();
 
@@ -118,8 +135,8 @@ export function effectiveZoneDetail(restZone, projection, topLevelDevice, device
     return restZone;
 }
 
-// zoneMembershipPresentation labels a member's own card with the group it
-// belongs to. Only the master's card carries the full zone summary.
+// zoneMembershipPresentation labels the fallback member card when projected
+// membership cannot be hidden under the master's full zone summary.
 export function zoneMembershipPresentation(membership) {
     if (!membership) return null;
 
