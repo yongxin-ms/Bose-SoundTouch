@@ -9,43 +9,11 @@ export const SETTINGS_SECTION_ORDER = [
     'wifiOnboarding',
 ];
 
-export function deviceSettingsTitle(name, role = '') {
+export function deviceSettingsTitle(name, role = '', prefix = 'Device settings') {
     const target = typeof name === 'string' ? name.trim() : '';
     const targetRole = typeof role === 'string' ? role.trim().toUpperCase() : '';
     const identity = [targetRole, target].filter(Boolean).join(' · ');
-    return identity ? `Device settings · ${identity}` : 'Device settings';
-}
-
-export function deviceSettingsTarget(deviceId, device) {
-    const fallbackId = typeof deviceId === 'string' ? deviceId.trim() : '';
-    const pair = device?.stereoPair;
-
-    if (!pair) {
-        return fallbackId ? {
-            controlId: fallbackId,
-            physicalId: String(device?.info?.device_id || '').trim() || fallbackId,
-            name: device?.info?.name || fallbackId,
-            role: '',
-        } : null;
-    }
-
-    const masterDeviceId = String(pair.masterDeviceId || '').trim();
-    const master = Array.isArray(pair.members)
-        ? pair.members.find(member => String(member?.deviceId || '').trim() === masterDeviceId)
-        : null;
-
-    // A pair is listed under its master's registry key, which is the page's
-    // deviceId. The member's ipAddress is what the speaker reports about
-    // itself; it differs from the key for a speaker registered by hostname or
-    // one with a second interface, and the service does not know it as an id.
-    if (!fallbackId || !masterDeviceId || !master) return null;
-
-    return {
-        controlId: fallbackId,
-        physicalId: masterDeviceId,
-        name: master.name || fallbackId,
-        role: String(master.role || '').trim().toUpperCase(),
-    };
+    return identity ? `${prefix} · ${identity}` : prefix;
 }
 
 function hasError(errors, keys) {

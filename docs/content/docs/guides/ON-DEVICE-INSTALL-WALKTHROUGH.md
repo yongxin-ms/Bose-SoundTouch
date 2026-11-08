@@ -63,7 +63,6 @@ AfterTouch (~15.5 MB at v0.131.0) is installed. That is enough for the binary
 plus one gzip-compressed rollback backup, but not for much else. Check first:
 
 ```bash
-rw            # remount rootfs read-write
 df -h /mnt/nv
 ```
 
@@ -95,12 +94,12 @@ df -h /mnt/nv   # confirm space recovered
 
 ## Step 3 — Install (or upgrade) AfterTouch
 
-Run the canonical one-liner. It downloads the binary and init script,
-creates `/mnt/nv/aftertouch/`, symlinks `/opt/aftertouch`, backs up the
+Run the canonical one-liner. It makes the root filesystem writable, downloads
+the binary and init script, creates `/mnt/nv/aftertouch/`, symlinks `/opt/aftertouch`, backs up the
 currently running binary, and starts the service:
 
 ```bash
-rw && curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | sh
+curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | sh
 ```
 
 By default this installs the **latest release** — the script resolves it from
@@ -110,11 +109,11 @@ GitHub's `releases/latest` redirect. To target a specific version instead:
 # Via environment variable — note it goes on `sh`, not `curl`: shell
 # variable-assignment prefixes only apply to the one command they're
 # attached to, and in a pipe each command is a separate process.
-# `VERSION=0.123.0 curl ... | sh` silently does NOT set it for `sh`.
-rw && curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | VERSION=0.123.0 sh
+# `VERSION=0.138.1 curl ... | sh` silently does NOT set it for `sh`.
+curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | VERSION=0.138.1 sh
 
 # Via command-line flag (pass args after sh -s --)
-curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | sh -s -- --version 0.123.0
+curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | sh -s -- --version 0.138.1
 ```
 
 Verify the installed version:
@@ -123,7 +122,7 @@ Verify the installed version:
 wget -qO- http://localhost:8000/health
 ```
 
-The JSON response should include `"version":"v0.123.0"` (or whichever
+The JSON response should include `"version":"v0.138.1"` (or whichever
 version you installed).
 
 ---
@@ -301,13 +300,13 @@ one:
 cd /mnt/nv/aftertouch
 
 curl -L --fail -o soundtouch-cli \
-  https://github.com/gesellix/Bose-SoundTouch/releases/download/v0.123.0/soundtouch-cli-v0.123.0-linux-armv7
+  https://github.com/gesellix/Bose-SoundTouch/releases/download/v0.138.1/soundtouch-cli-v0.138.1-linux-armv7
 chmod +x soundtouch-cli
 
 /mnt/nv/aftertouch/soundtouch-cli --version
 ```
 
-Replace `v0.123.0` with the version you installed. If you want the CLI
+Replace `v0.138.1` with the version you installed. If you want the CLI
 alternatives in Steps 6/7, download it here first, before doing those
 steps — it'll be in place and already persistent either way.
 
@@ -416,15 +415,15 @@ older artefacts to keep `/mnt/nv` free:
 
 ```bash
 # Update to latest release
-rw && curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | sh
+curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | sh
 
 # Update to a specific version — three equivalent forms
-rw && curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | VERSION=0.123.0 sh
+curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | VERSION=0.138.1 sh
 
-rw && curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | sh -s -- --version 0.123.0
+curl -sSL https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh | sh -s -- --version 0.138.1
 
 curl -sSLo install.sh https://raw.githubusercontent.com/gesellix/Bose-SoundTouch/main/scripts/on-device-install/install.sh
-sh install.sh --version 0.123.0
+sh install.sh --version 0.138.1
 ```
 
 The script's own final output already confirms the new version came up and
@@ -474,7 +473,7 @@ make build-linux-armv7   # builds build/soundtouch-service-linux-armv7,
 # into a rollback backup. Order matters — /mnt/nv has only ~20 MB free, so a
 # second full-size binary plus an uncompressed backup does not fit.
 ssh -oHostKeyAlgorithms=+ssh-rsa root@192.0.2.1
-rw
+mount -o remount,rw /
 /etc/init.d/aftertouch stop
 gzip -c /mnt/nv/aftertouch/aftertouch-service \
    > /mnt/nv/aftertouch/aftertouch-service.pre-test.backup.gz

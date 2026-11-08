@@ -89,6 +89,81 @@ func TestProjectDeviceEntriesCollapsesStereoPairUnderMaster(t *testing.T) {
 	}
 }
 
+func TestPhysicalSettingsTargetsUseRegistryKeysAndCapturedStatus(t *testing.T) {
+	group := testStereoGroup()
+	group.MasterDeviceID = "right-id"
+	left := projectionDeviceAt("left.local", "192.0.2.10", "left-id", "Left speaker", true, group)
+	right := projectionDeviceAt("right.local", "192.0.2.11", "right-id", "Right speaker", true, group)
+	left.Device.UpdateStatus(func(status *webtypes.DeviceStatus) {
+		status.Bass = &models.Bass{ActualBass: -3}
+	})
+	targets := projectDeviceEntries([]DeviceEntry{right, left})["right.local"].SettingsTargets
+	if len(targets) != 2 || targets[0].Role != "LEFT" || targets[1].Role != "RIGHT" {
+		t.Fatalf("settings order = %+v", targets)
+	}
+	if targets[0].ControlID != "left.local" || targets[1].ControlID != "right.local" ||
+		targets[0].PhysicalID != "left-id" || targets[0].Name != "Left speaker" {
+		t.Fatalf("physical registry identity lost: %+v", targets)
+	}
+	if targets[0].Status == nil || targets[0].Status.Bass == nil || targets[0].Status.Bass.ActualBass != -3 ||
+		targets[0].Status.Epoch != left.Device.Status().Epoch {
+		t.Fatalf("missing captured physical status: %+v", targets[0].Status)
+	}
+}
+
+func TestPhysicalSettingsTargetsPreserveStandaloneRegistryAliases(t *testing.T) {
+	address := projectionDevice("192.0.2.10", "speaker-id", "Speaker", true, nil)
+	hostname := projectionDeviceAt("speaker.local", "192.0.2.10", "speaker-id", "Speaker", true, nil)
+	entries := []DeviceEntry{address, hostname}
+	views := projectDeviceEntries(entries)
+	for _, entry := range entries {
+		view, ok := views[entry.ID]
+		if !ok || view.StereoPair != nil || len(view.SettingsTargets) != 1 {
+			t.Fatalf("standalone alias %q lost settings: %+v", entry.ID, view)
+		}
+		target := view.SettingsTargets[0]
+		if target.ControlID != entry.ID || target.PhysicalID != "speaker-id" ||
+			target.Name != "Speaker" || target.Role != "" || target.Status != entry.Device.Status() {
+			t.Fatalf("standalone alias %q changed registry target: %+v", entry.ID, target)
+		}
+	}
+}
+
+func TestPhysicalSettingsTargetsPreserveStandaloneWithoutInfo(t *testing.T) {
+	conn := webtypes.NewDeviceConnection(nil, nil)
+	view := projectDeviceEntries([]DeviceEntry{{ID: "speaker.local", Device: conn}})["speaker.local"]
+	if view.Info != nil || len(view.SettingsTargets) != 1 {
+		t.Fatalf("standalone without discovery info lost settings: %+v", view)
+	}
+	target := view.SettingsTargets[0]
+	if target.ControlID != "speaker.local" || target.PhysicalID != "" ||
+		target.Name != "" || target.Role != "" || target.Status != conn.Status() {
+		t.Fatalf("standalone without discovery info changed registry target: %+v", target)
+	}
+}
+
+func TestPhysicalSettingsTargetsOmitAmbiguousAndMissingPairMembers(t *testing.T) {
+	group := testStereoGroup()
+	left := projectionDevice("left.local", "left-id", "Left", true, group)
+	right := projectionDevice("right.local", "right-id", "Right", true, group)
+	alias := projectionDevice("right-alias.local", "right-id", "Right", true, group)
+	captured := captureDeviceProjectionEntries([]DeviceEntry{left, right, alias})
+	_, _, byDeviceID := projectLogicalDeviceEntries(captured)
+	pair := &stereoPairView{Members: []stereoPairMemberView{
+		{DeviceID: "left-id", Role: "LEFT"},
+		{DeviceID: "right-id", Role: "RIGHT"},
+	}}
+	targets := physicalSettingsTargets(captured[0], pair, byDeviceID)
+	if len(targets) != 1 || targets[0].PhysicalID != "left-id" ||
+		targets[0].ControlID != "left.local" || targets[0].Role != "LEFT" {
+		t.Fatalf("ambiguous pair member gained a control target: %+v", targets)
+	}
+	targets = projectDeviceEntries([]DeviceEntry{left})["left.local"].SettingsTargets
+	if len(targets) != 1 || targets[0].PhysicalID != "left-id" || targets[0].ControlID != "left.local" {
+		t.Fatalf("missing peer gained a control target: %+v", targets)
+	}
+}
+
 // TestProjectDeviceEntriesNormalizesMemberRoleAndDeviceID guards against
 // emitting raw, un-normalized Role/DeviceID into the frontend-facing JSON
 // while validMasterGroup/registeredMembersAgree/sameGroupClaim all

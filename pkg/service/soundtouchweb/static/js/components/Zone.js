@@ -9,10 +9,12 @@ import {
     zoneMemberCountSummary,
     zoneMemberIdentifiers,
     zoneMemberMetadata,
+    zoneRowOwnsMemberSettings,
     zoneTopologyFingerprint,
 } from '../zonePresentation.mjs';
 import { ZoneMemberVolumeControl } from './ZoneMemberVolumeControl.js';
 import { volumeProjectionKey } from '../zoneVolumeResult.mjs';
+import { MemberSettings } from './MemberSettings.js';
 
 const html = htm.bind(h);
 
@@ -273,6 +275,9 @@ export function Zone({ deviceId, devices, onSelectMember, volumePreview = null }
                         })}
                     </div>
                 ` : null}
+                ${zoneRowOwnsMemberSettings(resolved.controlId, deviceId, devices?.[deviceId])
+                    ? html`<${MemberSettings} deviceId=${resolved.controlId} device=${devices?.[resolved.controlId]} />`
+                    : null}
             </div>
         `;
     }

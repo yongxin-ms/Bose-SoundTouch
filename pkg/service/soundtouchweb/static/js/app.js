@@ -16,8 +16,7 @@ import { PlayURL } from './components/PlayURL.js';
 import { TTS } from './components/TTS.js';
 import { Announcements } from './components/Announcements.js';
 import { ContentPlaybackCommand } from './components/ContentPlaybackCommand.js';
-import { Settings } from './components/Settings.js';
-import { deviceSettingsTarget } from './settingsPresentation.mjs';
+import { MemberSettings } from './components/MemberSettings.js';
 import { api } from './api.js';
 import { isSoundTouch10StereoPair } from './stereoPresentation.mjs';
 import { previousDetailTarget } from './devicePresentation.js';
@@ -79,8 +78,14 @@ export function mergeDevicesSnapshot(previous, snapshot) {
     const devices = Object.fromEntries(Object.entries(snapshot || {}).map(([deviceId, incoming]) => {
         const current = Object.prototype.hasOwnProperty.call(previous, deviceId)
             ? previous[deviceId] : null;
-        if (!current || acceptsNewerStatus(current.status, incoming?.status)) {
+        if (!current) {
             return [deviceId, incoming];
+        }
+        const samePendingRevision = current.settingsIdentityPending && !staleSettingsTargets(incoming, current) &&
+            statusEpoch(current.status) === statusEpoch(incoming?.status) &&
+            current.status?.revision === incoming?.status?.revision;
+        if (acceptsNewerStatus(current.status, incoming?.status) || samePendingRevision) {
+            return [deviceId, mergePhysicalSettingsStatus(incoming, current)];
         }
         // Keep the whole entry we already hold, not just its status. The
         // server derives stereoPair from the very status.Group this snapshot
@@ -90,7 +95,7 @@ export function mergeDevicesSnapshot(previous, snapshot) {
         // with a matching projection, and one is due within 5s (sooner in
         // practice: whatever produced the newer status also queued a
         // device-list broadcast).
-        return [deviceId, current];
+        return [deviceId, mergePhysicalSettingsStatus(current, incoming)];
     }));
     return reconcileZoneMemberships(refreshAcceptedZoneMembers(devices));
 }
@@ -204,6 +209,54 @@ function volumePairIdentity(pair) {
         (pair?.members || []).map(member => [member.deviceId, member.role]).sort()];
 }
 
+// A status-only readback can overtake the inventory carrying its projection.
+// Only identity transitions fence sound; volume/capability changes do not.
+function settingsStatusIdentity(status) {
+    const group = status?.group;
+    return JSON.stringify([statusEpoch(status), group?.ID || '', group?.MasterDeviceID || '',
+        (group?.Roles?.Roles || []).map(member => [member.DeviceID, member.Role]).sort()]);
+}
+
+function settingsTopology(device) {
+    return JSON.stringify([
+        device?.info?.device_id || '',
+        device?.stereoPair?.id || '',
+        device?.stereoPair?.masterDeviceId || '',
+        (device?.stereoPair?.members || []).map(member => [member.deviceId, member.role]).sort(),
+    ]);
+}
+
+// A master revision does not order registry changes of its hidden peer.
+// Retain newer connection evidence when a delayed inventory uses an older key.
+function staleSettingsTargets(incoming, current) {
+    return (incoming?.settingsTargets || []).some(target =>
+        (current?.settingsTargets || []).some(previous => {
+            if (target.physicalId !== previous.physicalId) return false;
+            const before = statusEpoch(previous.status), after = statusEpoch(target.status);
+            return before !== null && (after === null || before > after ||
+                (before === after && previous.controlId !== target.controlId));
+        }));
+}
+
+// Hidden physical speakers advance independently of their logical master's
+// status. Merge only child status for the same accepted identity/topology;
+// taking a rejected snapshot must never revive its old pair membership.
+function mergePhysicalSettingsStatus(accepted, other) {
+    let pending = Boolean(accepted?.settingsIdentityPending) || staleSettingsTargets(accepted, other);
+    if (!Array.isArray(accepted?.settingsTargets) || settingsTopology(accepted) !== settingsTopology(other)) {
+        return pending ? { ...accepted, settingsIdentityPending: true } : accepted;
+    }
+    const targets = accepted.settingsTargets.map(target => {
+        const candidates = (other?.settingsTargets || []).filter(candidate =>
+            candidate.controlId === target.controlId && candidate.physicalId === target.physicalId && candidate.role === target.role);
+        const candidate = candidates.length === 1 ? candidates[0] : null;
+        if (!candidate || !acceptsNewerStatus(target.status, candidate.status)) return target;
+        pending ||= settingsStatusIdentity(target.status) !== settingsStatusIdentity(candidate.status);
+        return { ...target, status: candidate.status };
+    });
+    return { ...accepted, settingsTargets: targets, settingsIdentityPending: pending };
+}
+
 function replaceDevice(previous, deviceId, device) {
     return Object.fromEntries([
         ...Object.entries(previous),
@@ -216,18 +269,39 @@ export function mergeStatusUpdate(previous, deviceId, status) {
     // check: a deviceId of "__proto__" or "constructor" would otherwise
     // resolve through the prototype chain to a truthy value and pass the
     // check despite not being a real, known device.
-    if (!Object.prototype.hasOwnProperty.call(previous, deviceId) ||
-        !acceptsNewerStatus(previous[deviceId]?.status, status)) {
-        return previous;
+    if (!Object.prototype.hasOwnProperty.call(previous, deviceId)) {
+        const physicalId = status?.bass?.DeviceID || status?.balance?.DeviceID ||
+            status?.volume?.DeviceID || status?.nowPlaying?.DeviceID;
+        if (!physicalId) return previous;
+        let changed = false;
+        const devices = Object.fromEntries(Object.entries(previous).map(([id, device]) => {
+            let memberChanged = false;
+            let pending = Boolean(device.settingsIdentityPending);
+            const targets = device.settingsTargets?.map(target => {
+                if (target.controlId !== deviceId || target.physicalId !== physicalId ||
+                    !acceptsNewerStatus(target.status, status)) return target;
+                changed = memberChanged = true;
+                pending ||= settingsStatusIdentity(target.status) !== settingsStatusIdentity(status);
+                return { ...target, status };
+            });
+            return [id, memberChanged ? { ...device, settingsTargets: targets, settingsIdentityPending: pending } : device];
+        }));
+        return changed ? devices : previous;
     }
+    if (!acceptsNewerStatus(previous[deviceId]?.status, status)) return previous;
     return refreshAcceptedZoneMembers(replaceDevice(previous, deviceId, {
         ...previous[deviceId],
         status,
+        settingsIdentityPending: previous[deviceId].settingsIdentityPending ||
+            settingsStatusIdentity(previous[deviceId].status) !== settingsStatusIdentity(status),
         // A status delta carries no fresh info identity. After a connection
         // replacement, wait for a full accepted inventory before deriving its
         // contribution to a retained logical group.
         volumeIdentityPending: previous[deviceId].volumeIdentityPending ||
             statusEpoch(previous[deviceId].status) !== statusEpoch(status),
+        settingsTargets: previous[deviceId].settingsTargets?.map(target =>
+            target.controlId === deviceId && target.physicalId === previous[deviceId].info?.device_id &&
+            acceptsNewerStatus(target.status, status) ? { ...target, status } : target),
     }));
 }
 
@@ -399,7 +473,6 @@ export function DeviceDetail({
         `;
     }
 
-    const settingsTarget = deviceSettingsTarget(deviceId, device);
 
     function beginGroupVolume(level, generation) {
         clearPreviewExpiry();
@@ -551,15 +624,7 @@ export function DeviceDetail({
                 commandBusy=${commandBusy}
                 onPlay=${playRecent}
             />
-            ${settingsTarget ? html`
-                <${Settings}
-                    key=${`settings:${settingsTarget.controlId}:${settingsTarget.physicalId}`}
-                    deviceId=${settingsTarget.controlId}
-                    targetIdentity=${settingsTarget.physicalId}
-                    targetName=${settingsTarget.name}
-                    targetRole=${settingsTarget.role}
-                />
-            ` : null}
+            ${!device.zone ? html`<${MemberSettings} deviceId=${deviceId} device=${device} nested=${false} />` : null}
             ${!device.stereoPair ? html`
                 <div class="device-management-section">
                     <div class="section-title">Device management</div>

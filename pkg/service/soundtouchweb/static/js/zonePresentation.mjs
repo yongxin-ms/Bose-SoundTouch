@@ -85,6 +85,13 @@ export function zoneTopologyFingerprint(zone) {
     ]);
 }
 
+// A speaker's own page shows its settings at the top level unless it is the
+// zone master, whose page leaves them to its member row. Mounting both would
+// give one speaker two independent write schedulers.
+export function zoneRowOwnsMemberSettings(memberId, pageDeviceId, pageDevice) {
+    return memberId !== pageDeviceId || Boolean(pageDevice?.zone);
+}
+
 export function effectiveZoneDetail(restZone, projection, topLevelDevice, deviceId) {
     if (projection) {
         const members = projection.members || [];
@@ -133,23 +140,6 @@ export function effectiveZoneDetail(restZone, projection, topLevelDevice, device
     }
 
     return restZone;
-}
-
-// zoneMembershipPresentation labels the fallback member card when projected
-// membership cannot be hidden under the master's full zone summary.
-export function zoneMembershipPresentation(membership) {
-    if (!membership) return null;
-
-    const master = String(membership.masterName || membership.masterControlId || '').trim();
-    if (!master) return null;
-
-    return {
-        label: `In group · ${master}`,
-        title: membership.degraded
-            ? `Member of the group led by ${master}; the group is degraded`
-            : `Member of the group led by ${master}`,
-        degraded: Boolean(membership.degraded),
-    };
 }
 
 export function zoneCardPresentation(zone) {
