@@ -1347,6 +1347,13 @@ func collapseDuplicatePresets(presets []models.ServicePreset) ([]models.ServiceP
 // Speaker is the source of truth: this only un-rots data that was
 // never the speaker's perspective to begin with.
 func repairLeakedSource(account, device, label, persistedSource, sourceID string, ds *DataStore) string {
+	if named := canonicalContentSource(persistedSource); named != persistedSource {
+		log.Printf("[Datastore] %s: repaired numeric source %q -> %q (account=%s device=%s) — written while Sources.xml held the provider ID as type (issue 697)",
+			sanitizeLog(label), sanitizeLog(persistedSource), sanitizeLog(named), sanitizeLog(account), sanitizeLog(device))
+
+		return named
+	}
+
 	if !isLeakedSourceValue(persistedSource) {
 		return persistedSource
 	}
@@ -2405,7 +2412,7 @@ func (ds *DataStore) readConfiguredSourcesNoLock(account, device string) ([]mode
 		s.CreatedOn = ps.CreatedOn
 		s.UpdatedOn = ps.UpdatedOn
 		s.SourceProviderID = ps.SourceProviderID
-		s.SourceKey.Type = ps.SourceKey.Type
+		s.SourceKey.Type = canonicalSourceKeyType(ps.SourceKey.Type, ps.SourceProviderID)
 		s.SourceKey.Account = ps.SourceKey.Account
 
 		// Prioritize Credential element if present, otherwise use secret/secretType attributes

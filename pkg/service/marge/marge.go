@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -311,7 +312,18 @@ func mapPresetToParityXML(p models.ServicePreset, sources []models.ConfiguredSou
 	// Find and prepare source
 	matchedSource := findMatchingSourceForPreset(sources, p)
 	if matchedSource != nil {
-		PrepareConfiguredSource(matchedSource)
+		// Work on a copy: the source list is shared by every preset.
+		copySource := *matchedSource
+		PrepareConfiguredSource(&copySource)
+		// The account (a media server's "<UDN>/0", a Spotify user, ...) lives
+		// in SourceKey.Account; Username does not round-trip through the
+		// datastore. A speaker applies this list as is: with an empty
+		// <username> it drops the preset's account and recalling it fails
+		// with INVALID_SOURCE (issue 697), as it did for recents. Same rule
+		// as /full, which keeps the account: radio sources stay empty.
+		copySource.Username = recentSourceUsername(&copySource)
+
+		matchedSource = &copySource
 	}
 
 	if p.ContentItemType == "" && p.Name == "" && p.Location == "" && (matchedSource == nil || matchedSource.ID == "") {
@@ -573,19 +585,27 @@ func recentToXML(r *models.ServiceRecent, matchingSrc *models.ConfiguredSource) 
 		}
 	}
 
+	lastPlayedAt := r.LastPlayedAt
+	if lastPlayedAt == "" && utcTime > 0 {
+		lastPlayedAt = time.Unix(utcTime, 0).UTC().Format("2006-01-02T15:04:05.000+00:00")
+	}
+
+	// Recents taken over from the speaker carry no createdOn. Fill in a value
+	// that stays the same from one response to the next. With "now" the
+	// served list changed on every request, so an ETag over the body could
+	// never match, and the speaker would rewrite its recents each time.
 	createdOn := r.CreatedOn
 	if createdOn == "" {
-		createdOn = FormatTime(time.Now())
+		createdOn = lastPlayedAt
+	}
+
+	if createdOn == "" {
+		createdOn = constants.DateStr
 	}
 
 	updatedOn := r.UpdatedOn
 	if updatedOn == "" {
 		updatedOn = createdOn
-	}
-
-	lastPlayedAt := r.LastPlayedAt
-	if lastPlayedAt == "" && utcTime > 0 {
-		lastPlayedAt = time.Unix(utcTime, 0).UTC().Format("2006-01-02T15:04:05.000+00:00")
 	}
 
 	res := recent{
@@ -1333,14 +1353,17 @@ func fillAccountInfo(ds *datastore.DataStore, account string, resp *models.Accou
 	}
 }
 
-func getAccountDevices(ds *datastore.DataStore, account string, entries []os.DirEntry) ([]models.AccountDevice, string) {
+func getAccountDevices(ds *datastore.DataStore, account string, entries []os.DirEntry) ([]models.AccountDevice, []string) {
 	return getAccountDevicesWithPresetReader(ds, account, entries, ds.GetPresets)
 }
 
-func getAccountDevicesWithPresetReader(ds *datastore.DataStore, account string, entries []os.DirEntry, readPresets func(string, string) ([]models.ServicePreset, error)) ([]models.AccountDevice, string) {
+// getAccountDevicesWithPresetReader returns the account's devices for /full,
+// and the IDs of every device directory, in directory order, for the
+// account-wide source list.
+func getAccountDevicesWithPresetReader(ds *datastore.DataStore, account string, entries []os.DirEntry, readPresets func(string, string) ([]models.ServicePreset, error)) ([]models.AccountDevice, []string) {
 	var (
-		devices      []models.AccountDevice
-		lastDeviceID string
+		devices   []models.AccountDevice
+		deviceIDs []string
 	)
 
 	for _, entry := range entries {
@@ -1349,7 +1372,7 @@ func getAccountDevicesWithPresetReader(ds *datastore.DataStore, account string, 
 		}
 
 		deviceID := entry.Name()
-		lastDeviceID = deviceID
+		deviceIDs = append(deviceIDs, deviceID)
 
 		dev, err := createAccountDevice(ds, account, deviceID, readPresets)
 		if err != nil {
@@ -1367,26 +1390,83 @@ func getAccountDevicesWithPresetReader(ds *datastore.DataStore, account string, 
 		devices = append(devices, dev)
 	}
 
-	return devices, lastDeviceID
+	return devices, deviceIDs
 }
 
-func getAccountSources(ds *datastore.DataStore, account, lastDeviceID string) []models.FullResponseSource {
-	var (
-		sources []models.ConfiguredSource
-		err     error
-	)
+// accountConfiguredSources is the account's source list: every source any
+// of its devices has, once.
+//
+// Bose kept sources per account, and its /full lists each one once for all
+// devices. AfterTouch stores a Sources.xml per device, and /full used to take
+// the alphabetically last device's file as the account's list, so a device
+// with fewer sources sorting last shrank what every speaker of the account was
+// told.
+//
+// A source is identified by its type and account. The devices are read last
+// to first, so the device that used to stand for the account still decides
+// order and IDs, and the others only add what it lacks. A device whose file
+// can't be read is skipped; when none can be read, ok is false.
+func accountConfiguredSources(ds *datastore.DataStore, account string, deviceIDs []string) (sources []models.ConfiguredSource, ok bool) {
+	seen := map[string]bool{}
 
-	if lastDeviceID != "" {
-		sources, err = ds.GetConfiguredSources(account, lastDeviceID)
-		if err == nil {
-			sources = mergeDefaultSources(sources, ds.GetInitialSources())
+	for _, deviceID := range slices.Backward(deviceIDs) {
+		deviceSources, err := ds.GetConfiguredSources(account, deviceID)
+		if err != nil {
+			continue
 		}
-	} else {
-		sources = ds.GetInitialSources()
+
+		ok = true
+
+		for j := range deviceSources {
+			if isAccountlessPlaceholder(&deviceSources[j]) {
+				continue
+			}
+
+			key := deviceSources[j].SourceKeyType + "\x00" + deviceSources[j].SourceKeyAccount
+			if seen[key] {
+				continue
+			}
+
+			seen[key] = true
+
+			sources = append(sources, deviceSources[j])
+		}
 	}
 
-	if err != nil {
-		return nil
+	return sources, ok
+}
+
+// isAccountlessPlaceholder reports a source of a provider that only works
+// with an account (Spotify, Amazon, a media server) but has none. Such an
+// entry can't be used; an Amazon one with an empty secret even makes the
+// speaker fail its login (MUSIC_SERVICE_ACCOUNT_LOGIN_FAILED). Keeping one
+// device's placeholder out of the account-wide list matters now that every
+// device contributes to it.
+func isAccountlessPlaceholder(s *models.ConfiguredSource) bool {
+	if s.SourceKeyAccount != "" {
+		return false
+	}
+
+	switch s.SourceKeyType {
+	case constants.ProviderSpotify, constants.ProviderAmazon, constants.ProviderStoredMusic:
+		return true
+	}
+
+	return false
+}
+
+func getAccountSources(ds *datastore.DataStore, account string, deviceIDs []string) []models.FullResponseSource {
+	var sources []models.ConfiguredSource
+
+	if len(deviceIDs) > 0 {
+		stored, ok := accountConfiguredSources(ds, account, deviceIDs)
+		if !ok {
+			return nil
+		}
+
+		sources = mergeDefaultSources(stored, ds.GetInitialSources())
+	} else {
+		sources = ds.GetInitialSources()
 	}
 
 	var fullSources []models.FullResponseSource
@@ -1481,9 +1561,9 @@ func AccountSourcesToXML(ds *datastore.DataStore, account string) ([]byte, error
 		return nil, err
 	}
 
-	_, lastDeviceID := getAccountDevices(ds, account, entries)
+	_, deviceIDs := getAccountDevices(ds, account, entries)
 	resp := models.AccountSourcesResponse{
-		Sources: getAccountSources(ds, account, lastDeviceID),
+		Sources: getAccountSources(ds, account, deviceIDs),
 	}
 
 	data, err := xml.Marshal(resp)
@@ -1573,9 +1653,9 @@ func accountFullToXML(ds *datastore.DataStore, account string, readPresets func(
 		return nil, err
 	}
 
-	devices, lastDeviceID := getAccountDevicesWithPresetReader(ds, account, entries, readPresets)
+	devices, deviceIDs := getAccountDevicesWithPresetReader(ds, account, entries, readPresets)
 	resp.Devices = devices
-	resp.Sources = getAccountSources(ds, account, lastDeviceID)
+	resp.Sources = getAccountSources(ds, account, deviceIDs)
 
 	data, err := xml.Marshal(resp)
 	if err != nil {
@@ -2553,7 +2633,13 @@ func AddSource(ds *datastore.DataStore, account, username, providerID, secret, s
 		case strconv.Itoa(constants.AmazonProviderID):
 			newSrc.SourceKey.Type = constants.ProviderAmazon
 		default:
-			newSrc.SourceKey.Type = providerID
+			// The source key carries the provider's name ("STORED_MUSIC"),
+			// as the speaker reports it, not its numeric ID. Presets and
+			// recents name their source by type, so a media server stored
+			// as type "7" matched none of them, and /presets served its
+			// presets without a source block (issue 697). Unknown IDs stay
+			// as they are.
+			newSrc.SourceKey.Type = constants.GetProviderName(providerID)
 		}
 
 		log.Printf("[Marge] Adding source %s (%s) for device %s", sanitizeLog(newSrc.SourceKey.Type), sanitizeLog(username), sanitizeLog(devID))

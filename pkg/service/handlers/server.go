@@ -86,6 +86,7 @@ type Server struct {
 	spotifyClientID          string
 	spotifyClientSecret      string
 	spotifyRedirectURI       string
+	envControlledSettings    map[string]string // Settings key -> variable that sets it
 	spotifyService           *spotify.Service
 	amazonClientID           string
 	amazonClientSecret       string
@@ -261,6 +262,7 @@ func NewServer(ds *datastore.DataStore, sm *setup.Manager, serverURL string, red
 		func() (string, string) { return s.mgmtUsername, s.mgmtPassword },
 	)
 	health.RegisterAdminAreaAuthCheck(s.healthRegistry, s.AdminAreaAuthMode)
+	health.RegisterPublicNetworkPlayerCheck(s.healthRegistry, s.playerOpenOnPublicNetwork)
 
 	// Health QuickFix executor for the empty-margeAccountUUID
 	// finding from RegisterSpeakerInfoReachable. Lives here (not in
@@ -680,6 +682,15 @@ func (s *Server) PlayerEnabled() bool {
 	return s.playerEnabled
 }
 
+// playerOpenOnPublicNetwork reports whether the player, which has no login of
+// its own, is enabled on an install marked public-network (issue 663).
+func (s *Server) playerOpenOnPublicNetwork() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.playerEnabled && s.deploymentMode == deploymentModePublicNetwork
+}
+
 // SetPlayerEnabled sets the live player-enabled flag. Called once at startup
 // from the persisted/CLI-derived config; HandleUpdateSettings calls it again
 // whenever the Settings-page toggle changes. Does not itself fire
@@ -689,6 +700,15 @@ func (s *Server) SetPlayerEnabled(enabled bool) {
 	defer s.mu.Unlock()
 
 	s.playerEnabled = enabled
+}
+
+// SetEnvControlledSettings records which Settings fields a flag or environment
+// variable sets, as settings key to variable name (issue 744).
+func (s *Server) SetEnvControlledSettings(controlled map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.envControlledSettings = controlled
 }
 
 // SetPlayerEnabledChangedHook registers a callback fired when the live
